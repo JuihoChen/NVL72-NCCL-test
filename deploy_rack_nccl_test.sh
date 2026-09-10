@@ -1,61 +1,52 @@
 #!/bin/bash
 # deploy_rack_nccl_test.sh
 #
-# Run from the jumper, from the folder containing rackXX.sh and the .sqsh
-# image (e.g. ~/carlonext). One script does everything end to end:
+# Run from the jumper, from the folder containing rackXX.sh and the
+# pre-built test pack (e.g. ~/carlonext). One script does everything:
 #
-#   1. scp's the .sqsh ONCE to node-00 (CM_IPS IP0), NFS-exports it, and
-#      mounts it read-only on every sibling node -- no 18x copy of a
-#      large image across the rack
-#   2. on EVERY node, IN PARALLEL, idempotently `enroot create`s a local
-#      container from that shared .sqsh. The nccl-tests binaries run
-#      INSIDE this container via `enroot start` -- nothing is extracted
-#      onto the bare host filesystem, so the node's own OS/environment is
-#      never touched. The unpacked container itself lives on the
-#      dedicated persistent data/scratch volume you point --data-dir at
-#      (NOT the OS disk, and NOT tmpfs) -- this is the slow step
-#      (unsquashing a multi-GB image), so it: (a) runs once, at deploy
-#      time, in parallel across all nodes instead of one-at-a-time, and
-#      (b) persists across reboots/shipping, so it never needs to be
-#      redone at the customer's site
-#   3. meshes root SSH key: node-00 -> siblings (mpirun launches node->node)
-#   4. generates and stages run_nccl_test.sh directly on node-00 -- no
+#   1. pushes the pack (a small tar.gz of just the *_perf binaries +
+#      their .so deps, NOT the full container) to EVERY node IN PARALLEL,
+#      and extracts it locally on each -- no NFS, no enroot/container at
+#      test time at all. Both the cached tar.gz and the extracted folder
+#      persist under --data-dir, so this never needs to be redone after a
+#      reboot (only at the customer's site, potentially much later than
+#      when this script ran on the production line). Pack layout is
+#      assumed to be bin/ (the *_perf binaries, PLUS a custom-built
+#      mpirun/orted/ompi_info/orterun -- built --without-slurm, since the
+#      system/container's own mpirun is built --with-slurm and rejects
+#      plain CLI options under its slurm-aware "schizo" personality) and
+#      lib/ (the .so deps for both the NCCL test binaries and this pack's
+#      private Open MPI build)
+#   2. meshes root SSH key: node-00 -> siblings (mpirun launches node->node)
+#   3. generates and stages run_nccl_test.sh directly on node-00 -- no
 #      separate script needed, ready to run immediately
-#   5. (optional, --auto) SSHes into node-00 and runs it for you
+#   4. (optional, --auto) SSHes into node-00 and runs it for you
 #
-# --data-dir <path> is REQUIRED: must be a path on a persistent volume
-# that is genuinely separate from the OS/root filesystem (e.g. a local
-# scratch/data partition or disk). Every node is checked at runtime
-# (`findmnt`) to confirm --data-dir is NOT on the same filesystem as /,
-# and the script refuses to proceed on that node if it is -- this is a
-# hard safety guard against accidentally writing container data onto the
-# system disk, not just a naming convention.
+# --data-dir <path> defaults to /root/portable-nccl if not given. It's a
+# plain local folder -- no separate-filesystem requirement is enforced
+# (this used to refuse to share a filesystem with /, but that check has
+# been removed since it doesn't apply here: nothing here modifies any
+# system libraries or touches anything else on the OS image).
 #
 # IMPORTANT: nvidia-imex health + /dev/nvidia-caps-imex-channels/channel0
-# are NOT checked here at deploy time. Unlike the container (above),
-# channel0 CANNOT be made to persist across reboot under any design --
-# it's a kernel-driver-backed device node that is always recreated fresh
-# on every boot, on every system. So that check (cheap: a service-active
-# check + an mknod, not the slow part) lives INSIDE run_nccl_test.sh and
-# runs fresh every single time the test is invoked, against every node,
-# right before mpirun. See "IMEX pre-flight" below.
+# CANNOT be made to persist across reboot under any design -- it's a
+# kernel-driver-backed device node recreated fresh on every boot, on
+# every system, unconditionally. So that check (cheap: a service-active
+# check + an mknod) lives INSIDE run_nccl_test.sh and runs fresh every
+# time the test is invoked, against every node, right before mpirun.
 #
 # Usage:
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag
-#                                                 # --data-dir is REQUIRED: your
-#                                                 # persistent scratch/data volume,
-#                                                 # NOT the OS disk (sqsh defaults
-#                                                 # to ./compiled-nccl-test-image+latest.sqsh)
-#   ./deploy_rack_nccl_test.sh rack17.sh my-image.sqsh --data-dir /raid/nccl-diag
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag --uuid 0x1969
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag --auto
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag --dry-run
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag --version
-#   ./deploy_rack_nccl_test.sh rack17.sh --data-dir /raid/nccl-diag --only 192.168.14.187,192.168.14.191
+#   ./deploy_rack_nccl_test.sh rack17.sh
+#                                                 # uses ./nccl-test-pack-arm64.tar.gz
+#                                                 # and /root/portable-nccl by default
+#   ./deploy_rack_nccl_test.sh rack17.sh my-pack.tar.gz --data-dir /opt/portable-nccl
+#   ./deploy_rack_nccl_test.sh rack17.sh --uuid 0x1969
+#   ./deploy_rack_nccl_test.sh rack17.sh --auto
+#   ./deploy_rack_nccl_test.sh rack17.sh --dry-run
+#   ./deploy_rack_nccl_test.sh rack17.sh --version
+#   ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.187,192.168.14.191
 #                                                 # redeploy just these node(s) after a
-#                                                 # hardware swap -- skips the NFS-mount
-#                                                 # and enroot container rebuild on every
-#                                                 # OTHER node in the rack
+#                                                 # hardware swap
 #
 # NCCL_MNNVL_UUID is auto-derived from the rack filename if not given
 # (rack17.sh -> 0x17, rack8.sh -> 0x08) -- a human-traceable tag, not a
@@ -64,35 +55,28 @@
 # RE-RUN / NODE-SWAP SAFETY: this script is safe to run 2+ times on the
 # same rack, including after the diag team physically swaps a node:
 #   - stale SSH host keys for swapped IPs are cleared automatically
-#     (new hardware = new host key, same IP -- otherwise SSH refuses to
-#     reconnect)
-#   - the sqsh copy to node-00 is skipped if the remote file already
-#     matches the local one's size (cheap re-runs, no repeated 7GB+ scp)
-#   - NFS export/mount, enroot container creation, and SSH key meshing
-#     are all check-before-act and won't duplicate work
-#   - use --only <ip1,ip2,...> to limit the NFS-mount + container-rebuild
-#     steps to just the swapped node(s); if node-00 itself is in that
-#     list, the script automatically falls back to a full rack pass
-#     since node-00 is the image/NFS source for everyone else
-#   - if a replacement node gets a NEW IP, just update CM_IPS in the
-#     rackXX.sh file accordingly before re-running -- everything else is
-#     driven off that array
+#   - the pack copy to each node is skipped if the remote file already
+#     matches the local one's size (cheap re-runs)
+#   - SSH key meshing is check-before-act and won't duplicate work
+#   - use --only <ip1,ip2,...> to limit the pack copy+extract to just the
+#     swapped node(s); if node-00 itself is in that list, the script
+#     automatically falls back to a full rack pass
+#   - if a replacement node gets a NEW IP, update CM_IPS in the rackXX.sh
+#     file first -- everything else is driven off that array
 #   - nvidia-imex/channel0 health doesn't need a redeploy at all after a
-#     reboot -- run_nccl_test.sh re-checks and repairs it every time it runs
-#     (this is unavoidable for channel0; it is NOT true of the container,
-#     which persists on --data-dir across reboots without any rework)
+#     reboot -- run_nccl_test.sh re-checks and repairs it every time it
+#     runs (this is unavoidable for channel0; it is NOT true of the pack,
+#     which persists under --data-dir across reboots without any rework)
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1"
+SCRIPT_VERSION="0.4"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHARE_DIR="/mnt/nccl-share"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
-CONTAINER_NAME="nccltest"
-CONTAINER_WORKDIR="/var/nccl-tests"          # nccl-tests build dir INSIDE the container
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
 GPUS_PER_NODE=4
-DEFAULT_SQSH_NAME="compiled-nccl-test-image+latest.sqsh"
+DEFAULT_PACK_NAME="nccl-test-pack-arm64.tar.gz"
+DEFAULT_DATA_DIR="/root/portable-nccl"
 IMEX_WAIT_ATTEMPTS=15
 IMEX_WAIT_SLEEP=2
 
@@ -105,7 +89,7 @@ for arg in "$@"; do
 done
 
 RACK_FILE=""
-SQSH=""
+PACK=""
 DRY_RUN=0
 AUTO=0
 MNNVL_UUID=""
@@ -118,16 +102,13 @@ while [[ $# -gt 0 ]]; do
     --uuid)     MNNVL_UUID="$2"; shift 2 ;;
     --only)     ONLY_RAW="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
-    *.sqsh)     SQSH="$1"; shift ;;
+    *.tar.gz)   PACK="$1"; shift ;;
     *)          RACK_FILE="$1"; shift ;;
   esac
 done
-[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> --data-dir <path> [sqsh_path] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--version]" >&2; exit 1; }
-[[ -n "$DATA_DIR" ]] || { echo "ERROR: --data-dir <path> is required -- point it at a persistent scratch/data volume on each node, NOT the OS disk (e.g. --data-dir /raid/nccl-diag)" >&2; exit 1; }
+[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--version]" >&2; exit 1; }
+DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
-ENROOT_DATA_PATH="${DATA_DIR}/enroot/data"
-ENROOT_RUNTIME_PATH="${DATA_DIR}/enroot/runtime"
-ENROOT_CACHE_PATH="${DATA_DIR}/enroot/cache"
 
 [[ -f "$RACK_FILE" ]] || RACK_FILE="$SCRIPT_DIR/$RACK_FILE"
 [[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found (checked cwd and $SCRIPT_DIR)" >&2; exit 1; }
@@ -144,13 +125,17 @@ if [[ -z "$MNNVL_UUID" ]]; then
   fi
 fi
 
-# Default sqsh: ./compiled-nccl-test-image+latest.sqsh next to this script
-if [[ -z "$SQSH" ]]; then
-  SQSH="$SCRIPT_DIR/$DEFAULT_SQSH_NAME"
+# Default pack: ./nccl-test-pack-arm64.tar.gz next to this script
+if [[ -z "$PACK" ]]; then
+  PACK="$SCRIPT_DIR/$DEFAULT_PACK_NAME"
 else
-  [[ -f "$SQSH" ]] || SQSH="$SCRIPT_DIR/$SQSH"
+  [[ -f "$PACK" ]] || PACK="$SCRIPT_DIR/$PACK"
 fi
-[[ -f "$SQSH" ]] || { echo "ERROR: sqsh not found: $SQSH (default is ./${DEFAULT_SQSH_NAME})" >&2; exit 1; }
+[[ -f "$PACK" ]] || { echo "ERROR: pack not found: $PACK (default is ./${DEFAULT_PACK_NAME})" >&2; exit 1; }
+PACK_BASENAME="$(basename "$PACK")"
+PACK_CACHE="${DATA_DIR}/${PACK_BASENAME}"
+PACK_DIR="${DATA_DIR}"          # pack's own build/ and lib/ land directly here
+RUN_DIR="${DATA_DIR}/run"
 
 [[ $DRY_RUN -eq 1 ]] && echo ">>> DRY-RUN MODE: no SSH/SCP/mount commands will actually run <<<"
 
@@ -162,15 +147,13 @@ source "$RACK_FILE"
 NODES=()
 for ((i=${#CM_IPS[@]}-1; i>=0; i--)); do NODES+=("${CM_IPS[$i]}"); done
 NODE00="${NODES[0]}"
-SUBNET=$(echo "$NODE00" | awk -F. '{print $1"."$2"."$3".0/24"}')
-SQSH_BASENAME="$(basename "$SQSH")"
 TOTAL_RANKS=$(( ${#NODES[@]} * GPUS_PER_NODE ))
 
-echo "=== Rack: $(basename "$RACK_FILE") | ${#NODES[@]} nodes | node-00=$NODE00 | sqsh=$SQSH_BASENAME | UUID=$MNNVL_UUID ==="
+echo "=== Rack: $(basename "$RACK_FILE") | ${#NODES[@]} nodes | node-00=$NODE00 | pack=$PACK_BASENAME ($(stat -c%s "$PACK" 2>/dev/null || echo '?') bytes) | UUID=$MNNVL_UUID | data-dir=$DATA_DIR ==="
 
-# --- Resolve --only into TARGET_NODES (the nodes that get the NFS mount +
-# enroot container rebuild re-applied). SSH mesh + staging always cover the
-# full rack since those are cheap and idempotent anyway.
+# --- Resolve --only into TARGET_NODES (the nodes that get the pack
+# copy+extract re-applied). SSH mesh + staging always cover the full rack
+# since those are cheap and idempotent anyway.
 TARGET_NODES=("${NODES[@]}")
 if [[ -n "$ONLY_RAW" ]]; then
   IFS=',' read -ra ONLY_IPS <<< "$ONLY_RAW"
@@ -185,17 +168,15 @@ if [[ -n "$ONLY_RAW" ]]; then
     TARGET_NODES+=("$want")
   done
   if printf '%s\n' "${TARGET_NODES[@]}" | grep -qx "$NODE00"; then
-    echo "NOTE: node-00 ($NODE00) is in --only -- it's the image/NFS source for the"
-    echo "      whole rack, so falling back to a full pass instead of a partial one."
+    echo "NOTE: node-00 ($NODE00) is in --only -- falling back to a full pass."
     TARGET_NODES=("${NODES[@]}")
   else
-    echo "--- Targeted redeploy: container rebuild limited to: ${TARGET_NODES[*]} ---"
+    echo "--- Targeted redeploy: pack copy+extract limited to: ${TARGET_NODES[*]} ---"
   fi
 fi
 
 # Swapped hardware on a reused IP means a NEW host key -- clear any stale
-# cached entry for everything we're about to SSH into this run, or SSH
-# will refuse to reconnect ("REMOTE HOST IDENTIFICATION HAS CHANGED").
+# cached entry for everything we're about to SSH into this run.
 if [[ $DRY_RUN -eq 0 ]]; then
   { echo "$NODE00"; printf '%s\n' "${TARGET_NODES[@]}"; } | sort -u | while read -r ip; do
     ssh-keygen -R "$ip" >/dev/null 2>&1 || true
@@ -206,11 +187,6 @@ fi
 ssh_do() {
   local host="$1"; shift
   if [[ $DRY_RUN -eq 1 ]]; then echo "[DRY-RUN] ssh root@${host} $*"; else ssh $SSH_OPTS "root@${host}" "$@"; fi
-}
-scp_do() {
-  local src="$1" host="$2" dst="$3"
-  if [[ $DRY_RUN -eq 1 ]]; then echo "[DRY-RUN] scp $src root@${host}:${dst}"
-  else scp $SSH_OPTS "$src" "root@${host}:${dst}"; fi
 }
 ssh_script() {  # usage: ssh_script <host> <<'EOF' ... EOF
   local host="$1"
@@ -224,99 +200,56 @@ ssh_script() {  # usage: ssh_script <host> <<'EOF' ... EOF
 }
 # ---------------------------------------------------------------------------
 
-echo "--- [1/5] Copying sqsh to node-00 ($NODE00), NFS-sharing to siblings ---"
-ssh_do "$NODE00" "mkdir -p ${SHARE_DIR}"
-if [[ $DRY_RUN -eq 1 ]]; then
-  echo "[DRY-RUN] would skip copy if remote size already matches local, else: scp $SQSH root@${NODE00}:${SHARE_DIR}/${SQSH_BASENAME}"
-else
-  LOCAL_SIZE=$(stat -c%s "$SQSH")
-  REMOTE_SIZE=$(ssh $SSH_OPTS "root@${NODE00}" "stat -c%s ${SHARE_DIR}/${SQSH_BASENAME} 2>/dev/null || echo 0")
-  if [[ "$REMOTE_SIZE" == "$LOCAL_SIZE" ]]; then
-    echo "  sqsh already present on node-00 with matching size (${LOCAL_SIZE} bytes) -- skipping copy"
-  else
-    scp $SSH_OPTS "$SQSH" "root@${NODE00}:${SHARE_DIR}/${SQSH_BASENAME}"
-  fi
-fi
+echo "--- [1/4] Distributing + extracting pack on target node(s) (parallel) ---"
+echo "    (no NFS, no container -- a plain tar.gz pushed to each node directly;"
+echo "     extracted under ${DATA_DIR} on each node)"
 
-ssh_script "$NODE00" <<EOF
-set -e
-command -v exportfs >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq nfs-kernel-server)
-grep -q "^${SHARE_DIR} " /etc/exports 2>/dev/null || echo "${SHARE_DIR} ${SUBNET}(ro,sync,no_subtree_check,no_root_squash)" >> /etc/exports
-exportfs -ra
-systemctl enable --now nfs-kernel-server 2>/dev/null || systemctl restart nfs-kernel-server
-EOF
-
-for ip in "${TARGET_NODES[@]}"; do
-  [[ "$ip" == "$NODE00" ]] && continue
-  ssh_script "$ip" <<EOF
-set -e
-command -v mount.nfs >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq nfs-common)
-mkdir -p ${SHARE_DIR}
-grep -q "${SHARE_DIR} " /etc/fstab 2>/dev/null || echo "${NODE00}:${SHARE_DIR} ${SHARE_DIR} nfs ro,_netdev 0 0" >> /etc/fstab
-mountpoint -q ${SHARE_DIR} || mount ${SHARE_DIR}
-EOF
-done
-
-echo "--- [2/5] Creating local enroot container '${CONTAINER_NAME}' on target node(s) (parallel) ---"
-echo "    (container only -- nothing extracted to the host OS filesystem;"
-echo "     persisted under ${DATA_DIR} on each node, verified separate from /)"
-
-container_create_node() {
+deploy_pack_node() {
   local ip="$1"
-  ssh_script "$ip" <<EOF
-set -e
-command -v enroot >/dev/null || { echo "ERROR: enroot missing on ${ip}" >&2; exit 1; }
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] would copy ${PACK} to $ip if size differs, and extract to ${PACK_DIR}"
+    return 0
+  fi
 
-# Hard safety check: refuse to write container data onto the same
-# filesystem as / (the OS disk), even if --data-dir was mistyped.
-mkdir -p "${DATA_DIR}"
-ROOT_DEV=\$(findmnt -n -o SOURCE / 2>/dev/null)
-DATA_DEV=\$(findmnt -n -o SOURCE --target "${DATA_DIR}" 2>/dev/null)
-if [[ -z "\$DATA_DEV" || "\$DATA_DEV" == "\$ROOT_DEV" ]]; then
-  echo "ERROR: [${ip}] ${DATA_DIR} is on the same filesystem as / -- refusing to" >&2
-  echo "       write enroot container data onto the OS/system disk. Point" >&2
-  echo "       --data-dir at a real separate scratch/data volume." >&2
-  exit 1
-fi
+  ssh $SSH_OPTS "root@${ip}" "mkdir -p ${PACK_DIR}"
 
-export ENROOT_DATA_PATH="${ENROOT_DATA_PATH}"
-export ENROOT_RUNTIME_PATH="${ENROOT_RUNTIME_PATH}"
-export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH}"
-mkdir -p "\$ENROOT_DATA_PATH" "\$ENROOT_RUNTIME_PATH" "\$ENROOT_CACHE_PATH"
+  LOCAL_SIZE=$(stat -c%s "$PACK")
+  REMOTE_SIZE=$(ssh $SSH_OPTS "root@${ip}" "stat -c%s ${PACK_CACHE} 2>/dev/null || echo 0")
+  if [[ "$REMOTE_SIZE" == "$LOCAL_SIZE" ]]; then
+    echo "  [$ip] pack already present with matching size (${LOCAL_SIZE} bytes) -- skipping copy"
+  else
+    echo "  [$ip] copying pack (~$((LOCAL_SIZE/1024/1024)) MB)..."
+    scp $SSH_OPTS "$PACK" "root@${ip}:${PACK_CACHE}"
+  fi
 
-if enroot list | grep -qx "${CONTAINER_NAME}"; then
-  echo "  [$ip] container '${CONTAINER_NAME}' already exists on ${DATA_DIR}, skipping"
-else
-  echo "  [$ip] creating container '${CONTAINER_NAME}' from ${SHARE_DIR}/${SQSH_BASENAME} (this is the slow step)"
-  enroot create --name ${CONTAINER_NAME} "${SHARE_DIR}/${SQSH_BASENAME}"
-  echo "  [$ip] container '${CONTAINER_NAME}' ready, persisted under ${DATA_DIR}"
-fi
-EOF
+  echo "  [$ip] extracting pack to ${PACK_DIR}..."
+  ssh $SSH_OPTS "root@${ip}" "mkdir -p ${PACK_DIR} && tar xzf ${PACK_CACHE} -C ${PACK_DIR}"
+  echo "  [$ip] pack ready at ${PACK_DIR}"
 }
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  for ip in "${TARGET_NODES[@]}"; do container_create_node "$ip"; done
+  for ip in "${TARGET_NODES[@]}"; do deploy_pack_node "$ip"; done
 else
   declare -A PIDS
   for ip in "${TARGET_NODES[@]}"; do
-    ( container_create_node "$ip" > "/tmp/.container_create_${ip}.log" 2>&1 ) &
+    ( deploy_pack_node "$ip" > "/tmp/.pack_deploy_${ip}.log" 2>&1 ) &
     PIDS["$ip"]=$!
   done
 
   FAILED=()
   for ip in "${!PIDS[@]}"; do
     wait "${PIDS[$ip]}" || FAILED+=("$ip")
-    sed "s/^/[$ip] /" "/tmp/.container_create_${ip}.log"
-    rm -f "/tmp/.container_create_${ip}.log"
+    sed "s/^/[$ip] /" "/tmp/.pack_deploy_${ip}.log"
+    rm -f "/tmp/.pack_deploy_${ip}.log"
   done
 
   if [[ ${#FAILED[@]} -gt 0 ]]; then
-    echo "ERROR: container creation failed on: ${FAILED[*]}" >&2
+    echo "ERROR: pack deployment failed on: ${FAILED[*]}" >&2
     exit 1
   fi
 fi
 
-echo "--- [3/5] Meshing root SSH key: node-00 -> siblings (required for mpirun AND the IMEX pre-flight) ---"
+echo "--- [2/4] Meshing root SSH key: node-00 -> siblings (required for mpirun AND the pre-flight) ---"
 ssh_do "$NODE00" "test -f /root/.ssh/id_ed25519 || ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 -q"
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[DRY-RUN] would fetch node-00 pubkey and append to authorized_keys on: ${NODES[*]}"
@@ -327,17 +260,18 @@ else
   done
 fi
 
-echo "--- [4/5] Staging run_nccl_test.sh on node-00 ---"
+echo "--- [3/4] Staging run_nccl_test.sh on node-00 ---"
 
 # mpirun's hostfile IS the IMEX node list (same convention as the
 # reference diag log: --hostfile /etc/nvidia-imex/nodes_config.cfg).
-# Each rank runs INSIDE the enroot container via `enroot start`, so the
-# host's own CUDA/NCCL/OpenMPI environment is never touched.
+# Each rank runs the bare *_perf binary directly -- no container, no
+# enroot at test time. Pack layout is build/ + lib/ at its top level, so
+# binary/lib paths are static, not discovered.
 #
-# IMEX pre-flight: every node's nvidia-imex health + channel0 is checked
-# (and repaired if needed) EVERY time this script runs, not just once at
-# deploy time -- a reboot wipes channel0 silently, so deploy-time checks
-# alone aren't enough. node-00 SSHes out to itself + every sibling here.
+# Pre-flight: every node's nvidia-imex health + channel0 is checked (and
+# repaired) EVERY time this runs, since that can't persist across reboot.
+# The pack itself is only verified present (cheap) -- it persists under
+# --data-dir, so the slow re-extract step should essentially never fire.
 build_run_script() {
 cat <<INNER
 #!/bin/bash
@@ -345,21 +279,17 @@ set -e
 
 IMEX_CFG="${IMEX_CFG}"
 SSH_OPTS="${SSH_OPTS}"
-SHARE_DIR="${SHARE_DIR}"
-SQSH_BASENAME="${SQSH_BASENAME}"
-CONTAINER_NAME="${CONTAINER_NAME}"
-export ENROOT_DATA_PATH="${ENROOT_DATA_PATH}"
-export ENROOT_RUNTIME_PATH="${ENROOT_RUNTIME_PATH}"
-export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH}"
+PACK_DIR="${PACK_DIR}"
+PACK_CACHE="${PACK_CACHE}"
 NODES=(
 $(for ip in "${NODES[@]}"; do printf '  "%s"\n' "$ip"; done)
 )
 NODE_LIST_CONTENT="\$(printf '%s\\n' "\${NODES[@]}")"
 
-echo "=== Pre-flight: checking nvidia-imex + channel0 + container on \${#NODES[@]} node(s) ==="
+echo "=== Pre-flight: checking nvidia-imex + channel0 + pack on \${#NODES[@]} node(s) ==="
 for ip in "\${NODES[@]}"; do
   ssh \$SSH_OPTS "root@\${ip}" "mkdir -p \$(dirname "${IMEX_CFG}") && cat > ${IMEX_CFG}" <<< "\$NODE_LIST_CONTENT"
-  ssh \$SSH_OPTS "root@\${ip}" ENROOT_DATA_PATH="\$ENROOT_DATA_PATH" ENROOT_RUNTIME_PATH="\$ENROOT_RUNTIME_PATH" ENROOT_CACHE_PATH="\$ENROOT_CACHE_PATH" SHARE_DIR="\$SHARE_DIR" SQSH_BASENAME="\$SQSH_BASENAME" CONTAINER_NAME="\$CONTAINER_NAME" bash -s <<'REMOTE'
+  ssh \$SSH_OPTS "root@\${ip}" PACK_DIR="\$PACK_DIR" PACK_CACHE="\$PACK_CACHE" bash -s <<'REMOTE'
 set -e
 if ! systemctl is-active --quiet nvidia-imex; then
   echo "  [\$(hostname)] nvidia-imex not active -- restarting..."
@@ -395,46 +325,82 @@ if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
 fi
 test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still missing on \$(hostname)" >&2; exit 1; }
 
-# Safety net only -- the container persists on the data-dir volume across
-# reboots, so this should normally be a no-op. Re-creates it (slow) only
-# if it's genuinely gone (e.g. the data volume itself was replaced).
-if ! enroot list | grep -qx "\$CONTAINER_NAME"; then
-  echo "  [\$(hostname)] container '\$CONTAINER_NAME' missing on persistent storage -- recreating (this will be slow)..."
-  enroot create --name "\$CONTAINER_NAME" "\$SHARE_DIR/\$SQSH_BASENAME"
+# Safety net only -- the pack persists under --data-dir across reboots,
+# so this should normally be a no-op. Re-extracts from the LOCAL cached
+# tar.gz (no network needed) only if it's genuinely gone.
+if [[ ! -f "\$PACK_DIR/bin/all_reduce_perf" || ! -f "\$PACK_DIR/bin/alltoall_perf" || ! -f "\$PACK_DIR/bin/mpirun" || ! -f "\$PACK_DIR/bin/orted" ]]; then
+  echo "  [\$(hostname)] nccl-test-pack missing/incomplete -- re-extracting from local cache..."
+  if [[ ! -f "\$PACK_CACHE" ]]; then
+    echo "ERROR: cached pack not found at \$PACK_CACHE on \$(hostname) -- redeploy needed" >&2
+    exit 1
+  fi
+  mkdir -p "\$PACK_DIR"
+  tar xzf "\$PACK_CACHE" -C "\$PACK_DIR"
 fi
 
-echo "  [\$(hostname)] nvidia-imex active, channel0 OK, container OK"
+echo "  [\$(hostname)] nvidia-imex active, channel0 OK, pack OK"
 REMOTE
 done
 echo "=== Pre-flight complete ==="
 
+ALLREDUCE_BIN="\$PACK_DIR/bin/all_reduce_perf"
+ALLTOALL_BIN="\$PACK_DIR/bin/alltoall_perf"
+MPIRUN_BIN="\$PACK_DIR/bin/mpirun"
+[[ -f "\$ALLREDUCE_BIN" ]] || { echo "ERROR: \$ALLREDUCE_BIN not found" >&2; exit 1; }
+[[ -f "\$ALLTOALL_BIN" ]]  || { echo "ERROR: \$ALLTOALL_BIN not found" >&2; exit 1; }
+[[ -f "\$MPIRUN_BIN" ]]    || { echo "ERROR: \$MPIRUN_BIN not found -- the pack must ship its own mpirun/orted built --without-slurm" >&2; exit 1; }
+
+# This pack ships its OWN mpirun/orted/ompi_info (built --without-slurm),
+# since the system/container's mpirun was built --with-slurm and rejects
+# plain CLI options under its slurm-aware "schizo" personality. OPAL_PREFIX
+# must point here so this relocatable Open MPI build finds its own orted
+# and libs on every node (not the system's).
+export OPAL_PREFIX="\$PACK_DIR"
+export PATH="\$PACK_DIR/bin:\$PATH"
+export LD_LIBRARY_PATH="\$PACK_DIR/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"
+echo "Binaries: \$ALLREDUCE_BIN | \$ALLTOALL_BIN | mpirun: \$MPIRUN_BIN"
+echo "LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
+
 NEXT_HOP=\$(awk 'NR==2{print \$1}' ${IMEX_CFG})
 IFACE=\$(ip route get "\$NEXT_HOP" 2>/dev/null | sed -E 's/.*?dev (\S+) .*/\1/;t;d')
 echo "Using interface: \$IFACE"
-mkdir -p ${SHARE_DIR}/results 2>/dev/null || true
-LOG="${SHARE_DIR}/results/\$(date +%Y%m%d_%H%M%S).log"
+mkdir -p ${RUN_DIR}/results 2>/dev/null || true
+LOG="${RUN_DIR}/results/\$(date +%Y%m%d_%H%M%S).log"
 
 run_one() {
-  local bin="\$1" args="\$2" label="\$3"
+  local bin_path="\$1" args="\$2" label="\$3"
   echo "--- \$label ---"
-  mpirun -np ${TOTAL_RANKS} -N ${GPUS_PER_NODE} --hostfile ${IMEX_CFG} \\
-    --bind-to none --oversubscribe \\
-    -x NCCL_DEBUG=WARN -x NCCL_MNNVL_ENABLE=2 -x NCCL_NVLS_ENABLE=1 \\
-    -x NCCL_P2P_DISABLE=0 -x NCCL_IB_DISABLE=1 -x CUDA_IPC_HANDLE_SHARING_SUPPORT=1 \\
-    -x CUDA_DEVICE_MAX_CONNECTIONS=1 -x NCCL_MNNVL_UUID=${MNNVL_UUID} -x NCCL_MIN_CTAS=32 \\
-    -x ENROOT_DATA_PATH -x ENROOT_RUNTIME_PATH -x ENROOT_CACHE_PATH \\
-    --mca btl tcp,self --mca btl_tcp_if_include \$IFACE --allow-run-as-root \\
+  "\$MPIRUN_BIN" \\
+    --mca schizo ompi \\
+    --mca pml ob1 \\
+    --mca btl tcp,self \\
+    --mca btl_tcp_if_include \$IFACE \\
     --mca coll_hcoll_enable 0 \\
-    enroot start --root \\
-      --mount /dev/nvidia-caps-imex-channels:/dev/nvidia-caps-imex-channels \\
-      --mount /dev/nvidia-caps:/dev/nvidia-caps \\
-      ${CONTAINER_NAME} -- ${CONTAINER_WORKDIR}/build/\$bin \$args
+    -np ${TOTAL_RANKS} \\
+    -N ${GPUS_PER_NODE} \\
+    --hostfile ${IMEX_CFG} \\
+    --bind-to none \\
+    --oversubscribe \\
+    --allow-run-as-root \\
+    -x OPAL_PREFIX="\$PACK_DIR" \\
+    -x PATH="\$PACK_DIR/bin:\$PATH" \\
+    -x LD_LIBRARY_PATH="\$PACK_DIR/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}" \\
+    -x NCCL_DEBUG=WARN \\
+    -x NCCL_MNNVL_ENABLE=2 \\
+    -x NCCL_NVLS_ENABLE=1 \\
+    -x NCCL_P2P_DISABLE=0 \\
+    -x NCCL_IB_DISABLE=1 \\
+    -x CUDA_IPC_HANDLE_SHARING_SUPPORT=1 \\
+    -x CUDA_DEVICE_MAX_CONNECTIONS=1 \\
+    -x NCCL_MNNVL_UUID=${MNNVL_UUID} \\
+    -x NCCL_MIN_CTAS=32 \\
+    "\$bin_path" \$args
 }
 
 {
   echo "\$(date) : $(basename "$RACK_FILE" .sh) | ${#NODES[@]} nodes | ${TOTAL_RANKS} GPUs | launch \$(hostname)"
-  run_one "all_reduce_perf" "-b 8 -e 32G -f 2 -g 1" "All-Reduce (${TOTAL_RANKS} GPUs)"
-  run_one "alltoall_perf"  "-d uint8 -b 8 -e 32G -f 2" "All-to-All (${TOTAL_RANKS} GPUs)"
+  run_one "\$ALLREDUCE_BIN" "-b 8 -e 32G -f 2 -g 1" "All-Reduce (${TOTAL_RANKS} GPUs)"
+  run_one "\$ALLTOALL_BIN"  "-d uint8 -b 8 -e 32G -f 2" "All-to-All (${TOTAL_RANKS} GPUs)"
   echo "\$(date) : Done."
 } 2>&1 | tee "\$LOG"
 echo ""
@@ -443,31 +409,32 @@ INNER
 }
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "[DRY-RUN] would push run_nccl_test.sh (NCCL_MNNVL_UUID=${MNNVL_UUID}, container=${CONTAINER_NAME} persisted under ${DATA_DIR}, pre-flight over ${#NODES[@]} nodes) to root@${NODE00}:${SHARE_DIR}/run_nccl_test.sh"
+  echo "[DRY-RUN] would push run_nccl_test.sh (NCCL_MNNVL_UUID=${MNNVL_UUID}, pack persisted under ${DATA_DIR}, pre-flight over ${#NODES[@]} nodes) to root@${NODE00}:${RUN_DIR}/run_nccl_test.sh"
 else
-  build_run_script | ssh $SSH_OPTS "root@${NODE00}" "cat > ${SHARE_DIR}/run_nccl_test.sh && chmod +x ${SHARE_DIR}/run_nccl_test.sh"
+  ssh $SSH_OPTS "root@${NODE00}" "mkdir -p ${RUN_DIR}"
+  build_run_script | ssh $SSH_OPTS "root@${NODE00}" "cat > ${RUN_DIR}/run_nccl_test.sh && chmod +x ${RUN_DIR}/run_nccl_test.sh"
 fi
 
 echo ""
-echo "=== Deploy complete: $(basename "$RACK_FILE") | node-00=${NODE00} | container=${CONTAINER_NAME} | data-dir=${DATA_DIR} ==="
+echo "=== Deploy complete: $(basename "$RACK_FILE") | node-00=${NODE00} | data-dir=${DATA_DIR} ==="
 
 if [[ $AUTO -eq 1 ]]; then
-  echo "--- [5/5] --auto: executing run_nccl_test.sh on node-00 now (includes IMEX pre-flight) ---"
+  echo "--- [4/4] --auto: executing run_nccl_test.sh on node-00 now (includes pre-flight) ---"
   mkdir -p results
   LOGFILE="results/$(basename "$RACK_FILE" .sh)_$(date +%Y%m%d_%H%M%S).log"
   if [[ $DRY_RUN -eq 1 ]]; then
-    echo "[DRY-RUN] would: ssh root@${NODE00} bash ${SHARE_DIR}/run_nccl_test.sh   (output -> $LOGFILE)"
+    echo "[DRY-RUN] would: ssh root@${NODE00} bash ${RUN_DIR}/run_nccl_test.sh   (output -> $LOGFILE)"
   else
-    ssh $SSH_OPTS "root@${NODE00}" "bash ${SHARE_DIR}/run_nccl_test.sh" | tee "$LOGFILE"
+    ssh $SSH_OPTS "root@${NODE00}" "bash ${RUN_DIR}/run_nccl_test.sh" | tee "$LOGFILE"
     echo "=== Log saved locally: $LOGFILE ==="
   fi
 else
   cat <<MSG
 
-Next: ssh root@${NODE00} then 'bash ${SHARE_DIR}/run_nccl_test.sh'
+Next: ssh root@${NODE00} then 'bash ${RUN_DIR}/run_nccl_test.sh'
       (this re-checks/repairs nvidia-imex + channel0 on every node first --
-      that's unavoidable on every boot. The container itself persists on
-      ${DATA_DIR} across reboots, so it is NOT re-unpacked here)
+      that's unavoidable on every boot. The pack itself persists on
+      ${DATA_DIR} across reboots, so it is NOT re-copied/re-extracted here)
       (or re-run this script with --auto to have it run for you)
 MSG
 fi
