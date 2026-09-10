@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.7"
+SCRIPT_VERSION="0.8"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -218,6 +218,28 @@ ssh_script() {  # usage: ssh_script <host> <<'EOF' ... EOF
   fi
 }
 # ---------------------------------------------------------------------------
+
+# --- [0/4] Preflight: verify passwordless SSH to all target nodes ----------
+if [[ $DRY_RUN -eq 0 ]]; then
+  echo "--- [0/4] Preflight: verifying passwordless root SSH to all ${#NODES[@]} node(s) ---"
+  MISSING_KEY=()
+  for ip in "${NODES[@]}"; do
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS "root@${ip}" true 2>/dev/null; then
+      MISSING_KEY+=("$ip")
+    fi
+  done
+  if [[ ${#MISSING_KEY[@]} -gt 0 ]]; then
+    echo "" >&2
+    echo "ERROR: passwordless SSH failed for ${#MISSING_KEY[@]} node(s):" >&2
+    for ip in "${MISSING_KEY[@]}"; do
+      echo "  root@${ip}" >&2
+    done
+    echo "" >&2
+    echo "Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script." >&2
+    exit 1
+  fi
+  echo "    all nodes reachable -- OK"
+fi
 
 echo "--- [1/4] Distributing + extracting pack on target node(s) (parallel) ---"
 echo "    (no NFS, no container -- a plain tar.gz pushed to each node directly;"
