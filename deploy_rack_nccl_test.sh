@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.9"
+SCRIPT_VERSION="0.10"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -115,9 +115,10 @@ MNNVL_UUID=""
 ONLY_RAW=""
 DATA_DIR=""
 BOOTSTRAP=0
+BOOTSTRAP_PASS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bootstrap) BOOTSTRAP=1; shift ;;
+    --bootstrap) BOOTSTRAP=1; [[ $# -gt 0 && "$1" != --* && "$1" != *.sh && "$1" != *.tar.gz ]] && { BOOTSTRAP_PASS="$1"; shift; } ;;
     --dry-run)  DRY_RUN=1; shift ;;
     --auto)     AUTO=1; shift ;;
     --uuid)     MNNVL_UUID="$2"; shift 2 ;;
@@ -127,7 +128,7 @@ while [[ $# -gt 0 ]]; do
     *)          RACK_FILE="$1"; shift ;;
   esac
 done
-[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap] [--version]" >&2; exit 1; }
+[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap [password]] [--version]" >&2; exit 1; }
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 
@@ -239,7 +240,12 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
     PUBKEY="$(cat "$PUBKEY_FILE")"
     echo "--- [bootstrap] Seeding root SSH key to all ${#NODES[@]} node(s) ---"
     echo "    Key: $PUBKEY_FILE"
-    read -rsp "    Root password for all rack nodes: " RACK_PASS; echo ""
+    if [[ -n "$BOOTSTRAP_PASS" ]]; then
+      RACK_PASS="$BOOTSTRAP_PASS"
+      echo "    Using password supplied via --bootstrap <password>"
+    else
+      read -rsp "    Root password for all rack nodes: " RACK_PASS; echo ""
+    fi
     BOOTSTRAP_FAIL=()
     for ip in "${NODES[@]}"; do
       if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
