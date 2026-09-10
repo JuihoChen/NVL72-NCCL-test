@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.8"
+SCRIPT_VERSION="0.9"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -114,8 +114,10 @@ AUTO=0
 MNNVL_UUID=""
 ONLY_RAW=""
 DATA_DIR=""
+BOOTSTRAP=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --bootstrap) BOOTSTRAP=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     --auto)     AUTO=1; shift ;;
     --uuid)     MNNVL_UUID="$2"; shift 2 ;;
@@ -125,7 +127,7 @@ while [[ $# -gt 0 ]]; do
     *)          RACK_FILE="$1"; shift ;;
   esac
 done
-[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--version]" >&2; exit 1; }
+[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap] [--version]" >&2; exit 1; }
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 
@@ -218,6 +220,45 @@ ssh_script() {  # usage: ssh_script <host> <<'EOF' ... EOF
   fi
 }
 # ---------------------------------------------------------------------------
+
+# --- [--bootstrap] First-time key seeding: push node-00's public key ------
+# Use this once on a freshly imaged rack where some nodes don't yet have
+# node-00's key in /root/.ssh/authorized_keys. Requires sshpass and the
+# rack's root password. After this, the normal SSH mesh keeps keys in sync.
+if [[ $BOOTSTRAP -eq 1 ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] --bootstrap: would push node-00 pubkey to all ${#NODES[@]} nodes via password SSH"
+  else
+    if ! command -v sshpass &>/dev/null; then
+      echo "ERROR: --bootstrap requires sshpass. Install it with: apt-get install -y sshpass" >&2
+      exit 1
+    fi
+    PUBKEY_FILE="/root/.ssh/id_ed25519.pub"
+    [[ -f "$PUBKEY_FILE" ]] || PUBKEY_FILE="/root/.ssh/id_rsa.pub"
+    [[ -f "$PUBKEY_FILE" ]] || { echo "ERROR: no public key found at /root/.ssh/id_ed25519.pub or id_rsa.pub" >&2; exit 1; }
+    PUBKEY="$(cat "$PUBKEY_FILE")"
+    echo "--- [bootstrap] Seeding root SSH key to all ${#NODES[@]} node(s) ---"
+    echo "    Key: $PUBKEY_FILE"
+    read -rsp "    Root password for all rack nodes: " RACK_PASS; echo ""
+    BOOTSTRAP_FAIL=()
+    for ip in "${NODES[@]}"; do
+      if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+        echo "  [${ip}] key seeded OK"
+      else
+        echo "  [${ip}] FAILED -- wrong password or node unreachable?" >&2
+        BOOTSTRAP_FAIL+=("$ip")
+      fi
+    done
+    if [[ ${#BOOTSTRAP_FAIL[@]} -gt 0 ]]; then
+      echo "" >&2
+      echo "ERROR: bootstrap failed for ${#BOOTSTRAP_FAIL[@]} node(s):" >&2
+      printf '  %s\n' "${BOOTSTRAP_FAIL[@]}" >&2
+      echo "Check password or network reachability, then retry --bootstrap." >&2
+      exit 1
+    fi
+    echo "--- [bootstrap] All nodes seeded. Continuing with normal deploy ---"
+  fi
+fi
 
 # --- [0/4] Preflight: verify passwordless SSH to all target nodes ----------
 if [[ $DRY_RUN -eq 0 ]]; then
