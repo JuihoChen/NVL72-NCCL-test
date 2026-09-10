@@ -1,5 +1,12 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
+**Doc version: v2** (2026-06-26)
+- v2: added "How the pack is built" section (`nccl_arm64.Dockerfile`),
+  corrected the pack-origin description (one-off Docker build, not a
+  manual unpack from the production container), added the Dockerfile to
+  the files-delivered table and a rebuild note under known assumptions.
+- v1: initial bare-`mpirun`/hostfile deployment writeup.
+
 ## Purpose
 
 The original SOP (`GB300_NVL72_NCCL_SOP_v6.md`) runs multi-node NCCL tests
@@ -49,10 +56,118 @@ came up working through this with the diag team:
    later on (see below), not just the NCCL test binaries.
 
 The resolution: build the test pack **once**, outside this deployment
-pipeline entirely (the diag team unpacks the binaries/libs they need from
-the container manually), ship it as a small `.tar.gz`, and have the
-deployment script just distribute and persist that tarball. No container
-runtime is involved at test time at all.
+pipeline entirely, in a one-off Docker image whose sole job is compiling a
+Slurm-free Open MPI plus pinned NCCL/nccl-tests, then copy the relevant
+`bin/`/`lib/`/`share/` content out of that image into a small `.tar.gz`.
+The deployment script just distributes and persists that tarball — no
+container runtime is involved at test time at all.
+
+## How the pack is built (`nccl_arm64.Dockerfile`)
+
+The pack is **not** unpacked from the production NCCL test container —
+it's built from a small, separate Dockerfile whose only purpose is
+producing a Slurm-free Open MPI alongside the same pinned NCCL/nccl-tests
+versions used elsewhere in this workflow:
+
+```dockerfile
+FROM nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04
+
+# Install build dependencies
+RUN apt update -y && apt install -y \
+    git \
+    wget \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    libhwloc-dev \
+    libevent-dev \
+    libpmix-dev \
+    libucx-dev \
+    pkg-config \
+    gfortran \
+    python3
+
+# Verify PMIx version in container (should show MAJOR=5)
+RUN if [ -f /usr/lib/aarch64-linux-gnu/pmix2/include/pmix_version.h ]; then \
+        cat /usr/lib/aarch64-linux-gnu/pmix2/include/pmix_version.h | grep -E "MAJOR|MINOR|RELEASE"; \
+    fi
+
+# Build OpenMPI 4.1.6 WITHOUT Slurm integration
+RUN wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.6.tar.gz && \
+    tar -xzf openmpi-4.1.6.tar.gz && \
+    cd openmpi-4.1.6 && \
+    ./configure \
+        --prefix=/usr/local \
+        --with-pmix=/usr/lib/aarch64-linux-gnu/pmix2 \
+        --without-slurm \
+        --with-ucx \
+        --disable-mpi-fortran && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+# Verify PMIx in new OpenMPI
+RUN /usr/local/bin/ompi_info | grep -i pmix
+
+# Pin to exact versions per NVIDIA GB300 NVL72 benchmark specification
+RUN git clone -b v2.28.7-1 https://github.com/NVIDIA/nccl.git /var/nccl && \
+    git clone -b v2.17.8 https://github.com/NVIDIA/nccl-tests.git /var/nccl-tests
+
+# Build NCCL from source
+WORKDIR /var/nccl
+RUN make -j$(nproc) src.build && \
+    make install && \
+    ldconfig
+
+# CRITICAL: Delete pre-bundled libnccl 2.25 from the CUDA base image
+RUN rm -f /usr/lib/aarch64-linux-gnu/libnccl* \
+    && rm -f /usr/lib/x86_64-linux-gnu/libnccl* \
+    && ldconfig
+
+# Build nccl-tests linking against the pinned NCCL build
+WORKDIR /var/nccl-tests
+RUN make MPI=1 \
+         MPI_HOME=/usr/local \
+         CUDA_HOME=/usr/local/cuda \
+         NCCL_HOME=/var/nccl
+```
+
+Points worth calling out:
+
+- **`--without-slurm` is set at configure time**, not bolted on after —
+  this is the actual origin of the pack's private Open MPI, which is why
+  `--mca schizo ompi` is still needed at runtime (see below): the build
+  flag controls what the binary is *capable* of, the MCA flag controls
+  which CLI personality it *uses* by default.
+- **Base image is the CUDA devel image** (`cuda:13.0.1-devel-ubuntu24.04`,
+  arm64/GB300), not the production NCCL test container — this Dockerfile
+  has no dependency on that container at all.
+- **PMIx comes from the distro package** (`libpmix-dev`, MCA `pmix2`,
+  expected MAJOR=5) rather than being built from source; Open MPI is
+  pointed at it via `--with-pmix=/usr/lib/aarch64-linux-gnu/pmix2`.
+- **UCX is enabled at configure time** (`--with-ucx`) even though the
+  deployed `run_nccl_test.sh` invocation forces `--mca btl tcp,self` —
+  UCX support is built in but isn't the transport actually selected for
+  this rack-internal test path.
+- **NCCL and nccl-tests are pinned to exact tags** (`v2.28.7-1` and
+  `v2.17.8`) per the NVIDIA GB300 NVL72 benchmark spec, built from source
+  against this same Open MPI — not whatever NCCL ships in the base image.
+- **The base image's bundled `libnccl` is deleted before the pinned build
+  installs** — without this, the dynamic linker could resolve the CUDA
+  image's stock `libnccl.so` (e.g. 2.25.x) ahead of or instead of the
+  pinned 2.28.7-1 build, silently testing the wrong NCCL version.
+- **`ldconfig` runs after both the Open MPI and NCCL installs** so the
+  build environment's linker cache reflects the new libraries
+  immediately, before nccl-tests links against them.
+
+**From this image to the deployed tarball:** the pack is assembled by
+copying `/usr/local/{bin,lib,share}` (the Slurm-free Open MPI install —
+`mpirun`/`orterun`/`orted`/`ompi_info` plus its MCA plugins and libs) and
+the compiled `*_perf` binaries from `/var/nccl-tests/build/` into a single
+directory tree, then `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. No
+other container content is included — this is a deliberately minimal,
+self-contained extraction, not a generic "copy the whole container" step.
 
 ## What's actually in the pack
 
@@ -63,10 +178,12 @@ same `bin/`:
 ```
 bin/      all_reduce_perf, alltoall_perf, all_gather_perf, broadcast_perf,
           gather_perf, hypercube_perf, reduce_perf, reduce_scatter_perf,
-          scatter_perf, sendrecv_perf
-          mpirun, orterun, orted, ompi_info   <- custom Open MPI build
+          scatter_perf, sendrecv_perf      <- from /var/nccl-tests/build
+          mpirun, orterun, orted, ompi_info   <- custom Open MPI 4.1.6 build
+                                                  (--without-slurm, from /usr/local)
 lib/      libmpi.so.40, libopen-rte.so.40, libopen-pal.so.40, libpmix.so.2,
-          libnccl.so.2, libcudart.so.13, libhwloc.so.15, libevent_core...
+          libnccl.so.2 (pinned v2.28.7-1), libcudart.so.13, libhwloc.so.15,
+          libevent_core...
           lib/openmpi/   <- MCA plugin .so's (btl, pml, coll, schizo, etc.)
 share/    man pages, openmpi help-*.txt, wrapper-data.txt
 ```
@@ -293,6 +410,7 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 |---|---|
 | `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. |
 | `test_all_racks.sh` | Thin loop over every `rackXX.sh` found next to it, calling `deploy_rack_nccl_test.sh` per rack and writing a pass/fail summary under `results/`. |
+| `nccl_arm64.Dockerfile` | One-off build recipe for the pack's contents (Slurm-free Open MPI 4.1.6 + pinned NCCL v2.28.7-1 + nccl-tests v2.17.8). Built once, not part of the per-rack deploy pipeline; its `/usr/local` + `/var/nccl-tests/build` output is copied out and `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. |
 
 Both expect to live in the same directory as the rack inventory files and
 the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
@@ -315,3 +433,9 @@ the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
 - **apt access**: if `nfs-kernel-server`/`nfs-common` ever reappear as a
   dependency in a future revision, note this deployment currently has
   *no* such dependency at all — pack distribution is pure `scp`+`tar`.
+- **Rebuilding the pack**: `nccl_arm64.Dockerfile` requires network/apt
+  access (git clones, `wget`, `apt install`) and is meant to be built
+  once, wherever that's convenient (does not need to be the jumper) —
+  not re-run per rack or per deploy. Bumping the pinned NCCL/nccl-tests
+  tags or the Open MPI version means rebuilding this image and
+  re-extracting a new `nccl-test-pack-arm64.tar.gz`.

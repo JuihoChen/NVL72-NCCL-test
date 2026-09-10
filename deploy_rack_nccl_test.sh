@@ -48,6 +48,16 @@
 #                                                 # redeploy just these node(s) after a
 #                                                 # hardware swap
 #
+# run_nccl_test.sh itself takes an optional NODE-count argument when run
+# manually on node-00 -- this is intentionally a node-00-side decision,
+# not a jumper flag, since it's the diag team member at the rack who
+# decides how many nodes to test with for a given run (capped at however
+# many nodes are in the rack, e.g. 18 for an NVL72):
+#   bash run/run_nccl_test.sh        # full rack (default, e.g. 18 nodes / 72 GPUs)
+#   bash run/run_nccl_test.sh 9      # half rack (9 nodes / 36 GPUs -- matches
+#                                     # NVIDIA's published GB300 NVL72 spec table)
+#   bash run/run_nccl_test.sh 1      # single-node smoke test (4 GPUs)
+#
 # NCCL_MNNVL_UUID is auto-derived from the rack filename if not given
 # (rack17.sh -> 0x17, rack8.sh -> 0x08) -- a human-traceable tag, not a
 # magic value; override with --uuid anytime.
@@ -70,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.4"
+SCRIPT_VERSION="0.6"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -286,6 +296,38 @@ $(for ip in "${NODES[@]}"; do printf '  "%s"\n' "$ip"; done)
 )
 NODE_LIST_CONTENT="\$(printf '%s\\n' "\${NODES[@]}")"
 
+# --- Node count selection -------------------------------------------------
+# This is a node-00-side decision, made by whoever is running the test --
+# not a jumper/deploy-time flag. Defaults to the full rack. Pass a smaller
+# count of whole nodes to match NVIDIA's published GB300 NVL72 spec-sheet
+# configurations (e.g. 9 nodes = 36 GPUs) or for a quick single-node
+# smoke test:
+#   bash run_nccl_test.sh        # full rack (default, \${#NODES[@]} nodes)
+#   bash run_nccl_test.sh 9      # 9 nodes (36 GPUs, half rack)
+#   bash run_nccl_test.sh 1      # 1 node (4 GPUs, smoke test)
+NODES_REQUESTED="\${1:-\${#NODES[@]}}"
+case "\$NODES_REQUESTED" in
+  -h|--help)
+    echo "Usage: \$0 [node_count]"
+    echo "  node_count: number of WHOLE nodes to test with (each contributes"
+    echo "  all ${GPUS_PER_NODE} of its GPUs). Default: \${#NODES[@]} (full rack)."
+    echo "  Must be between 1 and \${#NODES[@]} for this rack."
+    exit 0
+    ;;
+esac
+if ! [[ "\$NODES_REQUESTED" =~ ^[0-9]+\$ ]] || [[ "\$NODES_REQUESTED" -le 0 ]]; then
+  echo "ERROR: node_count must be a positive integer (got: \$NODES_REQUESTED)" >&2
+  exit 1
+fi
+if [[ \$NODES_REQUESTED -gt \${#NODES[@]} ]]; then
+  echo "ERROR: node_count (\$NODES_REQUESTED) exceeds this rack's \${#NODES[@]} nodes" >&2
+  exit 1
+fi
+RUN_GPUS=\$(( NODES_REQUESTED * ${GPUS_PER_NODE} ))
+RUN_HOSTFILE="${RUN_DIR}/hostfile_\${NODES_REQUESTED}node.cfg"
+printf '%s\\n' "\${NODES[@]:0:\$NODES_REQUESTED}" > "\$RUN_HOSTFILE"
+echo "Test scope: \$NODES_REQUESTED node(s) / \$RUN_GPUS GPUs (\$RUN_HOSTFILE)"
+
 echo "=== Pre-flight: checking nvidia-imex + channel0 + pack on \${#NODES[@]} node(s) ==="
 for ip in "\${NODES[@]}"; do
   ssh \$SSH_OPTS "root@\${ip}" "mkdir -p \$(dirname "${IMEX_CFG}") && cat > ${IMEX_CFG}" <<< "\$NODE_LIST_CONTENT"
@@ -365,7 +407,7 @@ NEXT_HOP=\$(awk 'NR==2{print \$1}' ${IMEX_CFG})
 IFACE=\$(ip route get "\$NEXT_HOP" 2>/dev/null | sed -E 's/.*?dev (\S+) .*/\1/;t;d')
 echo "Using interface: \$IFACE"
 mkdir -p ${RUN_DIR}/results 2>/dev/null || true
-LOG="${RUN_DIR}/results/\$(date +%Y%m%d_%H%M%S).log"
+LOG="${RUN_DIR}/results/\$(date +%Y%m%d_%H%M%S)_\${NODES_REQUESTED}node.log"
 
 run_one() {
   local bin_path="\$1" args="\$2" label="\$3"
@@ -376,9 +418,9 @@ run_one() {
     --mca btl tcp,self \\
     --mca btl_tcp_if_include \$IFACE \\
     --mca coll_hcoll_enable 0 \\
-    -np ${TOTAL_RANKS} \\
+    -np \$RUN_GPUS \\
     -N ${GPUS_PER_NODE} \\
-    --hostfile ${IMEX_CFG} \\
+    --hostfile \$RUN_HOSTFILE \\
     --bind-to none \\
     --oversubscribe \\
     --allow-run-as-root \\
@@ -398,9 +440,9 @@ run_one() {
 }
 
 {
-  echo "\$(date) : $(basename "$RACK_FILE" .sh) | ${#NODES[@]} nodes | ${TOTAL_RANKS} GPUs | launch \$(hostname)"
-  run_one "\$ALLREDUCE_BIN" "-b 8 -e 32G -f 2 -g 1" "All-Reduce (${TOTAL_RANKS} GPUs)"
-  run_one "\$ALLTOALL_BIN"  "-d uint8 -b 8 -e 32G -f 2" "All-to-All (${TOTAL_RANKS} GPUs)"
+  echo "\$(date) : $(basename "$RACK_FILE" .sh) | \$NODES_REQUESTED node(s) | \$RUN_GPUS GPUs | launch \$(hostname)"
+  run_one "\$ALLREDUCE_BIN" "-b 8 -e 32G -f 2 -g 1" "All-Reduce (\$RUN_GPUS GPUs)"
+  run_one "\$ALLTOALL_BIN"  "-d uint8 -b 8 -e 32G -f 2" "All-to-All (\$RUN_GPUS GPUs)"
   echo "\$(date) : Done."
 } 2>&1 | tee "\$LOG"
 echo ""
@@ -429,6 +471,7 @@ if [[ $AUTO -eq 1 ]]; then
     echo "=== Log saved locally: $LOGFILE ==="
   fi
 else
+  HALF_NODES=$(( ${#NODES[@]} / 2 ))
   cat <<MSG
 
 Next: ssh root@${NODE00} then 'bash ${RUN_DIR}/run_nccl_test.sh'
@@ -436,5 +479,9 @@ Next: ssh root@${NODE00} then 'bash ${RUN_DIR}/run_nccl_test.sh'
       that's unavoidable on every boot. The pack itself persists on
       ${DATA_DIR} across reboots, so it is NOT re-copied/re-extracted here)
       (or re-run this script with --auto to have it run for you)
+
+      Optional node-count arg (whole nodes, default = full rack):
+        bash ${RUN_DIR}/run_nccl_test.sh             # full rack (${#NODES[@]} nodes / ${TOTAL_RANKS} GPUs)
+        bash ${RUN_DIR}/run_nccl_test.sh ${HALF_NODES}              # half rack (${HALF_NODES} nodes / $((HALF_NODES * GPUS_PER_NODE)) GPUs)
 MSG
 fi
