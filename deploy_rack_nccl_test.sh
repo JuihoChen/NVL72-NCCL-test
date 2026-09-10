@@ -22,34 +22,65 @@
 #      separate script needed, ready to run immediately
 #   4. (optional, --auto) SSHes into node-00 and runs it for you
 #
-# --data-dir <path> defaults to /root/portable-nccl if not given.
+# --data-dir <path> defaults to /root/portable-nccl if not given. It's a
+# plain local folder -- no separate-filesystem requirement is enforced
+# (this used to refuse to share a filesystem with /, but that check has
+# been removed since it doesn't apply here: nothing here modifies any
+# system libraries or touches anything else on the OS image).
 #
 # IMPORTANT: nvidia-imex health + /dev/nvidia-caps-imex-channels/channel0
 # CANNOT be made to persist across reboot under any design -- it's a
-# kernel-driver-backed device node recreated fresh on every boot.
-# So that check lives INSIDE run_nccl_test.sh and runs fresh every time.
+# kernel-driver-backed device node recreated fresh on every boot, on
+# every system, unconditionally. So that check (cheap: a service-active
+# check + an mknod) lives INSIDE run_nccl_test.sh and runs fresh every
+# time the test is invoked, against every node, right before mpirun.
 #
 # Usage:
 #   ./deploy_rack_nccl_test.sh rack17.sh
+#                                                 # uses ./nccl-test-pack-arm64.tar.gz
+#                                                 # and /root/portable-nccl by default
 #   ./deploy_rack_nccl_test.sh rack17.sh my-pack.tar.gz --data-dir /opt/portable-nccl
 #   ./deploy_rack_nccl_test.sh rack17.sh --uuid 0x1969
 #   ./deploy_rack_nccl_test.sh rack17.sh --auto
 #   ./deploy_rack_nccl_test.sh rack17.sh --dry-run
 #   ./deploy_rack_nccl_test.sh rack17.sh --version
 #   ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.187,192.168.14.191
-#   ./deploy_rack_nccl_test.sh rack17.sh --bootstrap            # prompts for password
-#   ./deploy_rack_nccl_test.sh rack17.sh --bootstrap MyP@ss    # inline password (auto scripts)
+#                                                 # redeploy just these node(s) after a
+#                                                 # hardware swap
 #
-# run_nccl_test.sh node-count argument (run on node-00):
-#   bash run/run_nccl_test.sh        # full rack (default)
-#   bash run/run_nccl_test.sh 9      # half rack (9 nodes / 36 GPUs)
+# run_nccl_test.sh itself takes an optional NODE-count argument when run
+# manually on node-00 -- this is intentionally a node-00-side decision,
+# not a jumper flag, since it's the diag team member at the rack who
+# decides how many nodes to test with for a given run (capped at however
+# many nodes are in the rack, e.g. 18 for an NVL72):
+#   bash run/run_nccl_test.sh        # full rack (default, e.g. 18 nodes / 72 GPUs)
+#   bash run/run_nccl_test.sh 9      # half rack (9 nodes / 36 GPUs -- matches
+#                                     # NVIDIA's published GB300 NVL72 spec table)
+#   bash run/run_nccl_test.sh 1      # single-node smoke test (4 GPUs)
 #
-# NCCL_MNNVL_UUID is auto-derived from the rack filename if not given.
-# RE-RUN / NODE-SWAP SAFETY: this script is safe to run 2+ times.
+# NCCL_MNNVL_UUID is auto-derived from the rack filename if not given
+# (rack17.sh -> 0x17, rack8.sh -> 0x08) -- a human-traceable tag, not a
+# magic value; override with --uuid anytime.
+#
+# RE-RUN / NODE-SWAP SAFETY: this script is safe to run 2+ times on the
+# same rack, including after the diag team physically swaps a node:
+#   - stale SSH host keys for swapped IPs are cleared automatically
+#   - the pack copy to each node is skipped if the remote file already
+#     matches the local one's size (cheap re-runs)
+#   - SSH key meshing is check-before-act and won't duplicate work
+#   - use --only <ip1,ip2,...> to limit the pack copy+extract to just the
+#     swapped node(s); if node-00 itself is in that list, the script
+#     automatically falls back to a full rack pass
+#   - if a replacement node gets a NEW IP, update CM_IPS in the rackXX.sh
+#     file first -- everything else is driven off that array
+#   - nvidia-imex/channel0 health doesn't need a redeploy at all after a
+#     reboot -- run_nccl_test.sh re-checks and repairs it every time it
+#     runs (this is unavoidable for channel0; it is NOT true of the pack,
+#     which persists under --data-dir across reboots without any rework)
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.12"
+SCRIPT_VERSION="0.13"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -67,7 +98,9 @@ for arg in "$@"; do
   fi
 done
 
-# Root-privilege check
+# Root-privilege check: SSH into remote nodes as root requires the caller's
+# SSH identity to be trusted on the targets, which is only set up for root
+# on this controller. If not already root, stop early with a clear hint.
 if [[ "${EUID}" -ne 0 ]]; then
   echo "ERROR: this script must be run as root." >&2
   echo "       Please run 'sudo -s' first, then re-run this script." >&2
@@ -85,7 +118,7 @@ BOOTSTRAP=0
 BOOTSTRAP_PASS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bootstrap)
+    --bootstrap) 
       BOOTSTRAP=1
       shift
       if [[ $# -gt 0 && "$1" != --* && "$1" != *.sh && "$1" != *.tar.gz ]]; then
@@ -104,12 +137,12 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap [password]] [--version]" >&2; exit 1; }
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
-DATA_DIR="${DATA_DIR%/}"
+DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 
 [[ -f "$RACK_FILE" ]] || RACK_FILE="$SCRIPT_DIR/$RACK_FILE"
 [[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found (checked cwd and $SCRIPT_DIR)" >&2; exit 1; }
 
-# Auto-derive NCCL_MNNVL_UUID from rack filename
+# Auto-derive NCCL_MNNVL_UUID from the rack filename if not explicitly given
 if [[ -z "$MNNVL_UUID" ]]; then
   RACK_NUM=$(basename "$RACK_FILE" .sh | grep -oE '[0-9]+' | head -1)
   if [[ -n "$RACK_NUM" ]]; then
@@ -117,11 +150,11 @@ if [[ -z "$MNNVL_UUID" ]]; then
     echo "Auto-derived NCCL_MNNVL_UUID=${MNNVL_UUID} from rack filename (override with --uuid)"
   else
     MNNVL_UUID="0x0"
-    echo "WARNING: could not parse a rack number from $(basename "$RACK_FILE") -- defaulting NCCL_MNNVL_UUID=0x0" >&2
+    echo "WARNING: could not parse a rack number from $(basename "$RACK_FILE") -- defaulting NCCL_MNNVL_UUID=0x0 (set --uuid explicitly)" >&2
   fi
 fi
 
-# Default pack
+# Default pack: ./nccl-test-pack-arm64.tar.gz next to this script
 if [[ -z "$PACK" ]]; then
   PACK="$SCRIPT_DIR/$DEFAULT_PACK_NAME"
 else
@@ -130,7 +163,7 @@ fi
 [[ -f "$PACK" ]] || { echo "ERROR: pack not found: $PACK (default is ./${DEFAULT_PACK_NAME})" >&2; exit 1; }
 PACK_BASENAME="$(basename "$PACK")"
 PACK_CACHE="${DATA_DIR}/${PACK_BASENAME}"
-PACK_DIR="${DATA_DIR}"
+PACK_DIR="${DATA_DIR}"          # pack's own build/ and lib/ land directly here
 RUN_DIR="${DATA_DIR}/run"
 
 [[ $DRY_RUN -eq 1 ]] && echo ">>> DRY-RUN MODE: no SSH/SCP/mount commands will actually run <<<"
@@ -139,7 +172,7 @@ RUN_DIR="${DATA_DIR}/run"
 source "$RACK_FILE"
 [[ -n "${CM_IPS:-}" ]] || { echo "ERROR: CM_IPS array not found in $RACK_FILE" >&2; exit 1; }
 
-# CM_IPS is listed high-IP-first; reverse so index 0 = node-00
+# CM_IPS is listed high-IP-first (IP17..IP0); reverse so index 0 = IP0 = node-00
 NODES=()
 for ((i=${#CM_IPS[@]}-1; i>=0; i--)); do NODES+=("${CM_IPS[$i]}"); done
 NODE00="${NODES[0]}"
@@ -147,7 +180,9 @@ TOTAL_RANKS=$(( ${#NODES[@]} * GPUS_PER_NODE ))
 
 echo "=== Rack: $(basename "$RACK_FILE") | ${#NODES[@]} nodes | node-00=$NODE00 | pack=$PACK_BASENAME ($(stat -c%s "$PACK" 2>/dev/null || echo '?') bytes) | UUID=$MNNVL_UUID | data-dir=$DATA_DIR ==="
 
-# Resolve --only into TARGET_NODES
+# --- Resolve --only into TARGET_NODES (the nodes that get the pack
+# copy+extract re-applied). SSH mesh + staging always cover the full rack
+# since those are cheap and idempotent anyway.
 TARGET_NODES=("${NODES[@]}")
 if [[ -n "$ONLY_RAW" ]]; then
   IFS=',' read -ra ONLY_IPS <<< "$ONLY_RAW"
@@ -169,19 +204,20 @@ if [[ -n "$ONLY_RAW" ]]; then
   fi
 fi
 
-# Clear stale known_hosts entries (swap safety)
+# Swapped hardware on a reused IP means a NEW host key -- clear any stale
+# cached entry for everything we're about to SSH into this run.
 if [[ $DRY_RUN -eq 0 ]]; then
   { echo "$NODE00"; printf '%s\n' "${TARGET_NODES[@]}"; } | sort -u | while read -r ip; do
     ssh-keygen -R "$ip" >/dev/null 2>&1 || true
   done
 fi
 
-# dry-run aware helpers
+# --- dry-run aware helpers -------------------------------------------------
 ssh_do() {
   local host="$1"; shift
   if [[ $DRY_RUN -eq 1 ]]; then echo "[DRY-RUN] ssh root@${host} $*"; else ssh $SSH_OPTS "root@${host}" "$@"; fi
 }
-ssh_script() {
+ssh_script() {  # usage: ssh_script <host> <<'EOF' ... EOF
   local host="$1"
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] ssh root@${host} bash -s <<EOF"
@@ -191,12 +227,12 @@ ssh_script() {
     ssh $SSH_OPTS "root@${host}" bash -s
   fi
 }
+# ---------------------------------------------------------------------------
 
-# --- [--bootstrap] First-time key seeding ---------------------------------
-# Resolves the chicken-and-egg on freshly imaged racks: seeds node-00's
-# public key to every node via password SSH using sshpass.
-# Safe to re-run -- idempotent (won't duplicate an existing key).
-# Inline password form for automation: --bootstrap <password>
+# --- [--bootstrap] First-time key seeding: push node-00's public key ------
+# Use this once on a freshly imaged rack where some nodes don't yet have
+# node-00's key in /root/.ssh/authorized_keys. Requires sshpass and the
+# rack's root password. After this, the normal SSH mesh keeps keys in sync.
 if [[ $BOOTSTRAP -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] --bootstrap: would push node-00 pubkey to all ${#NODES[@]} nodes via password SSH"
@@ -219,22 +255,10 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
     fi
     BOOTSTRAP_FAIL=()
     for ip in "${NODES[@]}"; do
-      if timeout 15 sshpass -p "$RACK_PASS" ssh \
-          -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null \
-          -o LogLevel=ERROR \
-          -o NumberOfPasswordPrompts=1 \
-          -o PreferredAuthentications=password \
-          -o PubkeyAuthentication=no \
-          -o ConnectTimeout=8 \
-          "root@${ip}" \
-          "mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
-           grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || \
-           echo '${PUBKEY}' >> /root/.ssh/authorized_keys && \
-           chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+      if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o UserKnownHostsFile=/dev/null           -o LogLevel=ERROR           -o NumberOfPasswordPrompts=1           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
         echo "  [${ip}] key seeded OK"
       else
-        echo "  [${ip}] FAILED -- wrong password, node unreachable, or password auth disabled?" >&2
+        echo "  [${ip}] FAILED -- wrong password or node unreachable?" >&2
         BOOTSTRAP_FAIL+=("$ip")
       fi
     done
@@ -249,7 +273,7 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
   fi
 fi
 
-# --- [0/4] Preflight: verify passwordless SSH to all nodes ----------------
+# --- [0/4] Preflight: verify passwordless SSH to all target nodes ----------
 if [[ $DRY_RUN -eq 0 ]]; then
   echo "--- [0/4] Preflight: verifying passwordless root SSH to all ${#NODES[@]} node(s) ---"
   MISSING_KEY=()
@@ -265,8 +289,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
       echo "  root@${ip}" >&2
     done
     echo "" >&2
-    echo "Fix: re-run with --bootstrap [password] to seed the key, or" >&2
-    echo "     run 'ssh-copy-id root@<ip>' manually for each node above." >&2
+    echo "Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script." >&2
     exit 1
   fi
   echo "    all nodes reachable -- OK"
@@ -334,6 +357,16 @@ fi
 
 echo "--- [3/4] Staging run_nccl_test.sh on node-00 ---"
 
+# mpirun's hostfile IS the IMEX node list (same convention as the
+# reference diag log: --hostfile /etc/nvidia-imex/nodes_config.cfg).
+# Each rank runs the bare *_perf binary directly -- no container, no
+# enroot at test time. Pack layout is build/ + lib/ at its top level, so
+# binary/lib paths are static, not discovered.
+#
+# Pre-flight: every node's nvidia-imex health + channel0 is checked (and
+# repaired) EVERY time this runs, since that can't persist across reboot.
+# The pack itself is only verified present (cheap) -- it persists under
+# --data-dir, so the slow re-extract step should essentially never fire.
 build_run_script() {
 cat <<INNER
 #!/bin/bash
@@ -348,11 +381,22 @@ $(for ip in "${NODES[@]}"; do printf '  "%s"\n' "$ip"; done)
 )
 NODE_LIST_CONTENT="\$(printf '%s\\n' "\${NODES[@]}")"
 
+# --- Node count selection -------------------------------------------------
+# This is a node-00-side decision, made by whoever is running the test --
+# not a jumper/deploy-time flag. Defaults to the full rack. Pass a smaller
+# count of whole nodes to match NVIDIA's published GB300 NVL72 spec-sheet
+# configurations (e.g. 9 nodes = 36 GPUs) or for a quick single-node
+# smoke test:
+#   bash run_nccl_test.sh        # full rack (default, \${#NODES[@]} nodes)
+#   bash run_nccl_test.sh 9      # 9 nodes (36 GPUs, half rack)
+#   bash run_nccl_test.sh 1      # 1 node (4 GPUs, smoke test)
 NODES_REQUESTED="\${1:-\${#NODES[@]}}"
 case "\$NODES_REQUESTED" in
   -h|--help)
     echo "Usage: \$0 [node_count]"
-    echo "  node_count: number of WHOLE nodes to test with (default: \${#NODES[@]})"
+    echo "  node_count: number of WHOLE nodes to test with (each contributes"
+    echo "  all ${GPUS_PER_NODE} of its GPUs). Default: \${#NODES[@]} (full rack)."
+    echo "  Must be between 1 and \${#NODES[@]} for this rack."
     exit 0
     ;;
 esac
@@ -384,6 +428,7 @@ if ! systemctl is-active --quiet nvidia-imex; then
   done
   if [[ \$ok -eq 0 ]]; then
     echo "ERROR: nvidia-imex did not reach 'active' state on \$(hostname)" >&2
+    echo "       Check: systemctl status nvidia-imex ; journalctl -u nvidia-imex -n 50" >&2
     exit 1
   fi
 fi
@@ -407,6 +452,21 @@ if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
 fi
 test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still missing on \$(hostname)" >&2; exit 1; }
 
+# Clean/freshly-imaged racks (observed on GB300 MaxQ) have no zlib on the
+# system, so PMIx can't find a compression backend and prints a startup
+# warning ("PMIx was unable to find a usable compression library") on
+# every mpirun invocation. It's cosmetic -- doesn't affect the test -- but
+# noisy. The PMIX_MCA_pcompress_base_silence_warning=1 env-var route the
+# warning text itself suggests does NOT actually suppress it in practice
+# (confirmed by test); only the MCA param file does. Written per-node,
+# idempotently, so it self-heals after a re-image the same way the
+# imex/channel0 checks above do.
+mkdir -p /root/.pmix
+grep -qxF 'pcompress_base_silence_warning = 1' /root/.pmix/mca-params.conf 2>/dev/null || echo 'pcompress_base_silence_warning = 1' >> /root/.pmix/mca-params.conf
+
+# Safety net only -- the pack persists under --data-dir across reboots,
+# so this should normally be a no-op. Re-extracts from the LOCAL cached
+# tar.gz (no network needed) only if it's genuinely gone.
 if [[ ! -f "\$PACK_DIR/bin/all_reduce_perf" || ! -f "\$PACK_DIR/bin/alltoall_perf" || ! -f "\$PACK_DIR/bin/mpirun" || ! -f "\$PACK_DIR/bin/orted" ]]; then
   echo "  [\$(hostname)] nccl-test-pack missing/incomplete -- re-extracting from local cache..."
   if [[ ! -f "\$PACK_CACHE" ]]; then
@@ -417,7 +477,7 @@ if [[ ! -f "\$PACK_DIR/bin/all_reduce_perf" || ! -f "\$PACK_DIR/bin/alltoall_per
   tar xzf "\$PACK_CACHE" -C "\$PACK_DIR"
 fi
 
-echo "  [\$(hostname)] nvidia-imex active, channel0 OK, pack OK"
+echo "  [\$(hostname)] nvidia-imex active, channel0 OK, PMIx compress-warning silenced, pack OK"
 REMOTE
 done
 echo "=== Pre-flight complete ==="
@@ -427,8 +487,13 @@ ALLTOALL_BIN="\$PACK_DIR/bin/alltoall_perf"
 MPIRUN_BIN="\$PACK_DIR/bin/mpirun"
 [[ -f "\$ALLREDUCE_BIN" ]] || { echo "ERROR: \$ALLREDUCE_BIN not found" >&2; exit 1; }
 [[ -f "\$ALLTOALL_BIN" ]]  || { echo "ERROR: \$ALLTOALL_BIN not found" >&2; exit 1; }
-[[ -f "\$MPIRUN_BIN" ]]    || { echo "ERROR: \$MPIRUN_BIN not found" >&2; exit 1; }
+[[ -f "\$MPIRUN_BIN" ]]    || { echo "ERROR: \$MPIRUN_BIN not found -- the pack must ship its own mpirun/orted built --without-slurm" >&2; exit 1; }
 
+# This pack ships its OWN mpirun/orted/ompi_info (built --without-slurm),
+# since the system/container's mpirun was built --with-slurm and rejects
+# plain CLI options under its slurm-aware "schizo" personality. OPAL_PREFIX
+# must point here so this relocatable Open MPI build finds its own orted
+# and libs on every node (not the system's).
 export OPAL_PREFIX="\$PACK_DIR"
 export PATH="\$PACK_DIR/bin:\$PATH"
 export LD_LIBRARY_PATH="\$PACK_DIR/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"

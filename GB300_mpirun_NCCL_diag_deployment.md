@@ -1,6 +1,22 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v4** (2026-07-15)
+**Doc version: v7** (2026-07-16)
+- v7: clarified out-of-place vs. in-place busbw columns in nccl-tests
+  output — NV's acceptance spec targets the **out-of-place** column, and
+  the ~870-930 GB/s figures flagged earlier in this doc were already that
+  column, so they pass against the ~900 GB/s ceiling.
+- v6: corrected the v5 PMIx compression-warning fix — the
+  `PMIX_MCA_pcompress_base_silence_warning=1` env-var route (what PMIx's
+  own warning text suggests) was tested and does **not** suppress the
+  warning; deploy script v0.13 instead writes the working
+  `/root/.pmix/mca-params.conf` fix on every node, idempotently, during
+  the existing per-node preflight loop (self-heals after a re-image the
+  same way the `nvidia-imex`/`channel0` checks do).
+- v5: added deploy script v0.12 fix for the PMIx "unable to find a usable
+  compression library" warning seen on clean/freshly-imaged GB300 MaxQ
+  racks (missing zlib) — silenced via `PMIX_MCA_pcompress_base_silence_warning=1`
+  exported/`-x`'d in `run_nccl_test.sh`, plus a note on reading
+  `Avg bus bandwidth` averages vs. per-size busbw.
 - v4: added deploy script v0.8 `[0/4]` preflight SSH key-check, v0.9
   `--bootstrap` first-time key-seeding flag, bootstrap lifecycle
   explanation, and `run_nccl_test.sh` password-prompt/hang diagnosis.
@@ -700,3 +716,83 @@ Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script.
 this catches exactly the nodes that would cause a silent hang during the
 actual test. The check also runs after `--bootstrap` seeding to confirm
 the seed worked before proceeding with the deploy.
+
+### `Avg bus bandwidth` looking low — check per-size busbw, not the average
+
+`all_reduce_perf`/`alltoall_perf` print one `Avg bus bandwidth` line at the
+end, which is the **mean across the entire size sweep** (`-b 8 -e 32G`),
+not just the large messages. Small message sizes are latency-bound, not
+bandwidth-bound, so they pull the average down hard — an average in the
+low hundreds of GB/s alongside per-line busbw of 870–930 GB/s at the top
+of the sweep is normal, not a regression. **Always read the per-size
+columns near the top of the `-e` range** (the largest message sizes) and
+compare those against the ~900 GB/s unidirectional ceiling — that's the
+number that actually reflects NVLS/SHARP health. The single `Avg` line is
+only useful as a same-rack, same-config regression check over time, the
+same way `SUM` is (see above), not as a pass/fail threshold on its own.
+
+Each size row prints **two** busbw columns side by side —
+**out-of-place** (separate send/recv buffers) then **in-place** (send and
+recv buffer are the same allocation, so the collective overwrites its
+input). **NV's acceptance spec targets the out-of-place column** — that's
+the one to check against the ~900 GB/s ceiling. The two columns can
+diverge at larger message sizes (in-place sometimes reads lower, since
+reduce-scatter/all-gather steps touch overlapping regions of the same
+buffer), so don't average them together or substitute one for the other
+when comparing against spec.
+
+### PMIx "unable to find a usable compression library" — clean/MaxQ racks
+
+Observed on a freshly-imaged **GB300 MaxQ** rack (clean environment, no
+prior manual package installs) partway through a test run, between the
+All-Reduce and All-to-All collectives:
+
+```
+--------------------------------------------------------------------------
+PMIx was unable to find a usable compression library
+on the system. We will therefore be unable to compress
+large data streams. This may result in longer-than-normal
+startup times and larger memory footprints. We will
+continue, but strongly recommend installing zlib or
+a comparable compression library for better user experience.
+--------------------------------------------------------------------------
+```
+
+**Root cause:** the freshly-imaged rack has no `zlib` (or equivalent)
+installed system-wide, so PMIx's `pcompress` framework has no backend to
+select. This is a clean-environment finding, not something seen on racks
+that already had packages installed for other reasons.
+
+**This is cosmetic, not a functional failure** — the All-Reduce run that
+produced it completed with `Out of bounds values : 0 OK` and busbw in the
+expected 870–930 GB/s range (see above). PMIx just falls back to sending
+data streams uncompressed, which only matters for startup time / memory
+footprint on very large messages, not correctness.
+
+**Fix shipped in deploy script v0.13:** the env-var route
+(`PMIX_MCA_pcompress_base_silence_warning=1`) that PMIx's own warning text
+suggests as an alternative to the config file was tried first (in v0.12)
+and **confirmed by direct test not to suppress the warning** — only the
+config file does. So `run_nccl_test.sh`'s existing per-node preflight loop
+(the same one that checks/repairs `nvidia-imex` and `channel0` on every
+node before every run) now also idempotently writes
+`/root/.pmix/mca-params.conf` with `pcompress_base_silence_warning = 1`
+on every node if it isn't already there:
+
+```
+mkdir -p /root/.pmix
+grep -qxF 'pcompress_base_silence_warning = 1' /root/.pmix/mca-params.conf 2>/dev/null || \
+  echo 'pcompress_base_silence_warning = 1' >> /root/.pmix/mca-params.conf
+```
+
+This runs on every node (including node-00) on every test invocation, so
+it self-heals after a re-image the same way the `imex`/`channel0` checks
+do — no manual per-node step required, and no dependency on the pack
+tarball itself (this lives under `/root`, outside `--data-dir`).
+
+Installing `zlib`/`libz` system-wide would resolve the warning at its
+root instead of silencing it, but per the "field site may not have
+apt/package access" principle behind this whole deployment (see
+"Why not a container at test time" above), a written config file that
+travels with the preflight logic is the approach that works everywhere,
+including at a customer site with no package access.
