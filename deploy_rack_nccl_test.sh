@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.6"
+SCRIPT_VERSION="0.7"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -97,6 +97,15 @@ for arg in "$@"; do
     exit 0
   fi
 done
+
+# Root-privilege check: SSH into remote nodes as root requires the caller's
+# SSH identity to be trusted on the targets, which is only set up for root
+# on this controller. If not already root, stop early with a clear hint.
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "ERROR: this script must be run as root." >&2
+  echo "       Please run 'sudo -s' first, then re-run this script." >&2
+  exit 1
+fi
 
 RACK_FILE=""
 PACK=""

@@ -1,6 +1,11 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v2** (2026-06-26)
+**Doc version: v3** (2026-07-01)
+- v3: added "Operational findings" section covering: `NCCL_MNNVL_ENABLE`
+  behaviour and busbw impact, NVLS/SHARP busbw-exceeds-ceiling explanation,
+  `knvlinkSendInbandData_IMPL` dmesg diagnosis and GB300 System SW fix
+  reference, nvbandwidth CE test interpretation, OOB TCP clarification,
+  and deploy script v0.7 root-privilege guard.
 - v2: added "How the pack is built" section (`nccl_arm64.Dockerfile`),
   corrected the pack-origin description (one-off Docker build, not a
   manual unpack from the production container), added the Dockerfile to
@@ -439,3 +444,172 @@ the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
   not re-run per rack or per deploy. Bumping the pinned NCCL/nccl-tests
   tags or the Open MPI version means rebuilding this image and
   re-extracting a new `nccl-test-pack-arm64.tar.gz`.
+
+## Operational findings
+
+Findings and clarifications captured during live rack deployments and benchmark
+analysis sessions. Ordered roughly by topic.
+
+### Script privilege requirement (v0.7)
+
+`deploy_rack_nccl_test.sh` must be invoked as root. Every SSH/SCP call inside
+the script connects to remote nodes as `root@<ip>`, and the SSH trust chain
+(node-00's key meshed to every sibling's `/root/.ssh/authorized_keys`) is only
+set up for root on the controller. Running as a regular user causes cascading
+`Permission denied` failures across all 18 nodes.
+
+From v0.7 the script detects this early and exits with a clear prompt:
+
+```
+ERROR: this script must be run as root.
+       Please run 'sudo -s' first, then re-run this script.
+```
+
+This check uses bash's `${EUID}` built-in and runs after `--version` (so
+`--version` still works without root) but before any rack files or SSH
+connections are touched.
+
+### Open MPI's "OOB" channel is plain TCP, not the BMC
+
+Open MPI uses the term *out-of-band (OOB) channel* for the TCP path that
+`mpirun`/`orted` use for process launch, wireup, and abort signals — in
+contrast to the high-speed fabric (NVLink/IB) that carries actual job data.
+This is the same host management NIC and IP range already listed in each
+`rackXX.sh` (e.g. `192.168.14.x`). It has no relation to the physical BMC
+network (iDRAC/iLO/Redfish sideband).
+
+An external controller (running `mpirun` from outside the rack) does not need
+a separate BMC IP table — the existing node-IP list is sufficient. What it
+does need is:
+- Network reachability from the controller into the management subnet across
+  all 18 node IPs (not just node-00).
+- Open MPI pinned to the correct management interface on multi-NIC GB300 nodes:
+  `--mca oob_tcp_if_include <iface/subnet>` to prevent Open MPI from picking
+  the wrong NIC on nodes that also have IB/RoCE interfaces.
+
+Note that bare `mpirun` (without Slurm) is a single point of failure: if the
+controller's process or network path to the rack drops, the job dies. A
+`tmux`/`screen` session protects against terminal disconnection but not a
+real network partition.
+
+### nvbandwidth CE test — interpreting the 4×4 matrix
+
+`nvbandwidth`'s `device_to_device_bidirectional_memcpy_read_ce` test produces
+a 4×4 per-GPU-pair bandwidth matrix for a single node (4 GPUs per GB300
+compute tray). A healthy result looks like:
+
+```
+           0         1         2         3
+ 0       N/A   1523.78   1527.04   1526.90
+ 1   1524.52       N/A   1526.90   1527.51
+ 2   1527.24   1527.38       N/A   1530.64
+ 3   1526.57   1528.46   1530.91       N/A
+
+SUM   18327.85
+COEFFICIENT_OF_VARIATION   0.00
+```
+
+Key things to check:
+- **`COEFFICIENT_OF_VARIATION = 0.00`** is the headline pass/fail signal —
+  all links performing identically; a non-trivial CoV would flag a degraded
+  or asymmetric NVLink pair, which would then appear as a low row/column.
+- **Per-pair values ~1527 GB/s**: Blackwell Ultra NVLink 5 spec is 1800 GB/s
+  total aggregate bidirectional (900 GB/s each direction). ~1527 GB/s measured
+  in a raw CE memcpy is ~85% of spec — normal, healthy efficiency. Protocol
+  and copy-engine overhead account for the gap.
+- **`SUM`** is a convenient single-number regression indicator for
+  comparing across racks or across reboots without eyeballing the whole matrix.
+
+### `NCCL_MNNVL_ENABLE` — `=2` vs `=1` and busbw impact
+
+`NCCL_MNNVL_ENABLE` controls whether NCCL is allowed to treat GPUs in
+separate physical nodes as part of the same NVLink fabric (multi-node NVLink
+domain). This is the knob behind `NCCL_MNNVL_UUID` auto-derived per rack by
+the deploy script.
+
+| Value | Behaviour |
+|---|---|
+| `2` (default) | Auto-detect; gracefully skips MNNVL if IMEX fabric isn't fully healthy, routes over whatever working NVLink path already exists. |
+| `1` | Force-enable; NCCL init fails if MNNVL is unsupported, but may also partially commit to MNNVL paths that are degraded, causing silent fallback to a slower transport. |
+| `0` | Disable entirely; useful to isolate IMEX issues. |
+
+In practice on GB300 NVL72: busbw of ~920 GB/s observed with `=2` dropped to
+~70x GB/s when forcing `=1`. This was traced to `NCCL_MNNVL_ENABLE=1`
+exposing intermittent NVLS multicast setup failures (see next section) that
+`=2`'s auto-detect quietly avoids by falling back to a healthy NVLink path.
+
+Note: `NCCL_MNNVL_ENABLE` (fabric scope) and `NCCL_NVLS_ENABLE` (switch
+in-flight reduction) are separate knobs. MNNVL being enabled is what allows
+the NVLS/SHARP path to extend *across* node boundaries on a multi-node rack;
+they are complementary, not the same setting.
+
+### Why AllReduce busbw can exceed the per-GPU NVLink ceiling
+
+`all_reduce_perf` reports two bandwidth numbers:
+- **Algorithm BW** = S ÷ t (message size ÷ measured time) — raw throughput.
+- **Bus BW (busbw)** = AlgBW × 2(N−1)/N — the number to compare against
+  hardware link specs.
+
+The `2(N−1)/N` multiplier was calibrated for **Ring/Tree** algorithms, which
+model every byte crossing each NVLink twice (scatter out, gather back). On
+NVSwitch hardware, NCCL frequently selects **NVLS (NVLink SHARP)** instead:
+the switch itself sums data from multiple GPUs in-flight, so each link carries
+its chunk only once. Since `busbw` is computed from time/size via the ring
+multiplier (not measured off the wire), applying a 2× model to NVLS's lighter
+real traffic mathematically produces a number that can exceed the link's
+physical ceiling (~900 GB/s unidirectional on Blackwell Ultra).
+
+**920 GB/s busbw is therefore not an error** — it indicates NVLS/SHARP is
+active and efficient. Documented in NVIDIA/nccl-tests issues #153, #272, #312.
+
+To confirm: run with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH,NVLS` and check
+the chosen algorithm in the init log.
+
+### `knvlinkSendInbandData_IMPL: Failed to send inband data` — known GB300 bug
+
+`dmesg` showing this error across all 18 nodes after a test run:
+
+```
+NVRM: knvlinkSendInbandData_IMPL: Failed to send inband data: 0
+```
+
+is the GPU driver failing to deliver inband control messages from the GPU to
+the GPU Fabric Manager (GFM) over the NVLink fabric — these messages are how
+each GPU coordinates NVLS multicast group setup with Fabric Manager. Dropped
+messages cause NVLS multicast setup to fail, forcing NCCL to fall back to
+Ring/Tree for that collective, which is why busbw drops when this occurs.
+
+**This is a documented GB300 bug fixed in System SW Release 1.0.1:**
+
+> *"Resolves an intermittent issue where NCCL all-reduce throughput drops.
+> This occurs only when NVLink SHARP is enabled and control messages from GPU
+> to GFM were dropped (for example, buffer contention), resulting in multicast
+> setup failure. This version adds fixes across the GPU driver, Fabric Manager,
+> and GPU firmware to improve the reliability of NVLS initialization."*
+> — NVIDIA DGX GB300 NVL72 Release Notes (RN-11874-001_1.0.6), §6.2 item #20
+
+**How to determine if you're affected:**
+Compare installed component versions against the 1.0.6 stack:
+
+| Component | 1.0.6 version |
+|---|---|
+| GPU Driver | 580.126.20 |
+| IMEX | 580.126.20 |
+| GPU Fabric Manager | 580.105.18 |
+| NVOS (NVSwitch OS) | 25.02.4347 |
+
+**Workaround (pre-upgrade):** set `NCCL_NVLS_ENABLE=0` to bypass NVLS
+multicast setup entirely. You lose the NVLS speed-up but eliminate this
+failure mode — more reliable for benchmark runs while awaiting the upgrade.
+
+**Upgrade note:** the release notes require upgrading *all* components
+rack-wide (compute trays + switch trays together). A partial upgrade may
+cause incompatibility during NVLink Recovery operations.
+
+**Diagnosis steps:**
+1. `journalctl -u nvidia-fabricmanager` around the dmesg timestamps — look
+   for multicast/partition setup failures.
+2. On the NVSwitch: `nv show sdn partition` — `Health` column should read
+   `healthy`.
+3. Rerun with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV` and
+   diff `=1` vs `=2` log for IMEX/MNNVL fallback lines and chosen algorithm.
