@@ -1,6 +1,9 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v3** (2026-07-01)
+**Doc version: v4** (2026-07-15)
+- v4: added deploy script v0.8 `[0/4]` preflight SSH key-check, v0.9
+  `--bootstrap` first-time key-seeding flag, bootstrap lifecycle
+  explanation, and `run_nccl_test.sh` password-prompt/hang diagnosis.
 - v3: added "Operational findings" section covering: `NCCL_MNNVL_ENABLE`
   behaviour and busbw impact, NVLS/SHARP busbw-exceeds-ceiling explanation,
   `knvlinkSendInbandData_IMPL` dmesg diagnosis and GB300 System SW fix
@@ -413,7 +416,7 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 
 | File | Purpose |
 |---|---|
-| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. |
+| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.9**. |
 | `test_all_racks.sh` | Thin loop over every `rackXX.sh` found next to it, calling `deploy_rack_nccl_test.sh` per rack and writing a pass/fail summary under `results/`. |
 | `nccl_arm64.Dockerfile` | One-off build recipe for the pack's contents (Slurm-free Open MPI 4.1.6 + pinned NCCL v2.28.7-1 + nccl-tests v2.17.8). Built once, not part of the per-rack deploy pipeline; its `/usr/local` + `/var/nccl-tests/build` output is copied out and `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. |
 
@@ -613,3 +616,87 @@ cause incompatibility during NVLink Recovery operations.
    `healthy`.
 3. Rerun with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV` and
    diff `=1` vs `=2` log for IMEX/MNNVL fallback lines and chosen algorithm.
+
+### SSH trust bootstrap — first-time rack deployment (`--bootstrap`)
+
+On a freshly imaged rack, no node has node-00's SSH public key in its
+`/root/.ssh/authorized_keys` yet — a chicken-and-egg problem: the deploy
+script meshes keys node-00 → siblings, but can't reach siblings without a
+key already in place.
+
+**Symptom** in `run_nccl_test.sh` output:
+```
+root@192.168.14.154's password:
+root@192.168.14.152's password:
+...
+--- All-Reduce (72 GPUs) ---
+<hangs indefinitely>
+```
+The pre-flight can prompt interactively for missing-key nodes; `mpirun`
+cannot (BatchMode) — it silently hangs waiting for the missing ranks to
+join the collective barrier.
+
+**Resolution: run `--bootstrap` once on first deployment:**
+```bash
+./deploy_rack_nccl_test.sh rack01.sh --bootstrap
+```
+
+Added in v0.9. Seeds node-00's public key to every node via password SSH
+using `sshpass`, then immediately continues into the normal deploy.
+Requires `sshpass` (`apt-get install -y sshpass`).
+
+**What it does per node:**
+- Creates `/root/.ssh/` with `700` permissions if missing
+- Appends node-00's public key to `authorized_keys` — idempotent (no
+  duplicates if already present)
+- Sets `authorized_keys` to `600`
+- Reports `OK` or `FAILED` per IP, exits on any failure before deploying
+
+**The root password** is the Linux root account password set during OS
+imaging — typically a site-wide default shared across all 18 nodes on a
+fresh rack. Nodes that don't match are reported as `FAILED` for manual
+follow-up via `ssh-copy-id root@<ip>`.
+
+**Full first-time lifecycle:**
+```
+Fresh rack (no SSH trust)
+        |
+        v
+./deploy_rack_nccl_test.sh rack01.sh --bootstrap
+  -> prompts once for root password
+  -> seeds node-00's key to all 18 nodes
+  -> continues with normal deploy [0/4] -> [1/4] -> [2/4] -> [3/4]
+        |
+        v
+All future runs -- no --bootstrap needed
+./deploy_rack_nccl_test.sh rack01.sh
+  -> [0/4] preflight confirms all nodes passwordlessly reachable
+  -> [2/4] mesh re-syncs key after any node swap
+```
+
+Re-run `--bootstrap` only if a node is **reimaged from scratch** (wiping
+its `authorized_keys`); the `[0/4]` preflight will flag it first.
+
+### `[0/4]` preflight SSH key-check (v0.8+)
+
+Before touching any rack files or SSH connections, `deploy_rack_nccl_test.sh`
+now runs a fast `BatchMode=yes` SSH check against every node:
+
+```
+--- [0/4] Preflight: verifying passwordless root SSH to all 18 node(s) ---
+    all nodes reachable -- OK
+```
+
+If any node fails:
+```
+ERROR: passwordless SSH failed for 2 node(s):
+  root@192.168.14.154
+  root@192.168.14.152
+
+Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script.
+```
+
+`BatchMode=yes` is the same non-interactive SSH mode `mpirun` uses — so
+this catches exactly the nodes that would cause a silent hang during the
+actual test. The check also runs after `--bootstrap` seeding to confirm
+the seed worked before proceeding with the deploy.

@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.10"
+SCRIPT_VERSION="0.11"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -118,7 +118,14 @@ BOOTSTRAP=0
 BOOTSTRAP_PASS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bootstrap) BOOTSTRAP=1; [[ $# -gt 0 && "$1" != --* && "$1" != *.sh && "$1" != *.tar.gz ]] && { BOOTSTRAP_PASS="$1"; shift; } ;;
+    --bootstrap) 
+      BOOTSTRAP=1
+      shift
+      if [[ $# -gt 0 && "$1" != --* && "$1" != *.sh && "$1" != *.tar.gz ]]; then
+        BOOTSTRAP_PASS="$1"
+        shift
+      fi
+      ;;
     --dry-run)  DRY_RUN=1; shift ;;
     --auto)     AUTO=1; shift ;;
     --uuid)     MNNVL_UUID="$2"; shift 2 ;;
@@ -248,7 +255,7 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
     fi
     BOOTSTRAP_FAIL=()
     for ip in "${NODES[@]}"; do
-      if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+      if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o UserKnownHostsFile=/dev/null           -o LogLevel=ERROR           -o NumberOfPasswordPrompts=1           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
         echo "  [${ip}] key seeded OK"
       else
         echo "  [${ip}] FAILED -- wrong password or node unreachable?" >&2
