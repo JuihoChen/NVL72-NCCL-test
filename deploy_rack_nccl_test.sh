@@ -77,10 +77,16 @@
 #     reboot -- run_nccl_test.sh re-checks and repairs it every time it
 #     runs (this is unavoidable for channel0; it is NOT true of the pack,
 #     which persists under --data-dir across reboots without any rework)
+#   - a stale all_reduce_perf/alltoall_perf/orted/mpirun process left over
+#     from a previously-aborted run is also checked for and killed on
+#     every node before every run (see run_nccl_test.sh's pre-flight) --
+#     left unchecked, it fails the NEXT run with "CUDA-capable device(s)
+#     is/are busy or unavailable", often against a different, innocent
+#     rank than the one actually holding the stale GPU context
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.14"
+SCRIPT_VERSION="0.15"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -465,6 +471,33 @@ if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
 fi
 test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still missing on \$(hostname)" >&2; exit 1; }
 
+# A previous run that got aborted (Ctrl-C, a bad rank, a node fault) can
+# leave a stale all_reduce_perf/alltoall_perf/orted/mpirun process still
+# holding a CUDA context on a GPU. mpirun aborts the ENTIRE job the
+# instant any single rank fails, so a single stale process on ONE node
+# surfaces on the NEXT run as "CUDA-capable device(s) is/are busy or
+# unavailable" -- often reported against a DIFFERENT, innocent rank,
+# followed by a cascade of "Open MPI failed to TCP connect to a peer"
+# warnings as the rest of the job gets torn down. Those TCP warnings are
+# the tear-down noise, not the root cause -- the root cause is the stale
+# process. Checked/cleared on every node before every run, same as
+# nvidia-imex/channel0/PMIx above.
+STALE_PIDS=\$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \\
+  | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun' | awk -F',' '{print \$1}')
+if [[ -n "\$STALE_PIDS" ]]; then
+  echo "  [\$(hostname)] stale test process(es) still attached to GPU -- killing: \$STALE_PIDS"
+  kill -9 \$STALE_PIDS 2>/dev/null || true
+  sleep 2
+  STILL=\$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \\
+    | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun')
+  if [[ -n "\$STILL" ]]; then
+    echo "ERROR: stale process(es) on \$(hostname) survived kill -9:" >&2
+    echo "\$STILL" >&2
+    echo "       Check for a wedged GPU (dmesg | grep -i xid) rather than retrying blindly." >&2
+    exit 1
+  fi
+fi
+
 # Clean/freshly-imaged racks (observed on GB300 MaxQ) have no zlib on the
 # system, so PMIx can't find a compression backend and prints a startup
 # warning ("PMIx was unable to find a usable compression library") on
@@ -490,7 +523,7 @@ if [[ ! -f "\$PACK_DIR/bin/all_reduce_perf" || ! -f "\$PACK_DIR/bin/alltoall_per
   tar xzf "\$PACK_CACHE" -C "\$PACK_DIR"
 fi
 
-echo "  [\$(hostname)] nvidia-imex active, channel0 OK, PMIx compress-warning silenced, pack OK"
+echo "  [\$(hostname)] nvidia-imex active, channel0 OK, no stale GPU processes, PMIx compress-warning silenced, pack OK"
 REMOTE
 done
 echo "=== Pre-flight complete ==="

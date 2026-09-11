@@ -1,6 +1,27 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v7** (2026-07-16)
+**Doc version: v9** (2026-07-20)
+- v9: added a shared-library audit of `nccl-test-pack-arm64.tar.gz`'s
+  `lib/` folder against every binary's actual `DT_NEEDED` entries
+  (`readelf -d`, cross-arch-safe) — confirms what's correctly shipped,
+  flags 4 libraries (`libstdc++.so.6`, `libgcc_s.so.1`, `libz.so.1`,
+  `libudev.so.1`) that are required but not shipped and are currently
+  relied on implicitly from the target node's base OS, and corrects the
+  v5/v6 PMIx root-cause note — if `libz.so.1` were truly absent,
+  `mpirun` couldn't have started at all, so the PMIx warning is more
+  likely an artifact of this pack's PMIx build not having its
+  zlib-backed `pcompress` component enabled, not a missing OS package.
+- v8: deploy script v0.15 adds a per-node pre-flight check for stale
+  `all_reduce_perf`/`alltoall_perf`/`orted`/`mpirun` processes left over
+  from a previously-aborted run, killing them before every test (same
+  self-healing pattern as `nvidia-imex`/`channel0`/PMIx) -- root cause of
+  the `CUDA-capable device(s) is/are busy or unavailable` +
+  `Open MPI failed to TCP connect to a peer` cascade seen after an
+  aborted run. Also documents v0.14's `--bootstrap` hardening: a 15s
+  `timeout` around the password-auth SSH call, and forcing
+  `PreferredAuthentications=password` / `PubkeyAuthentication=no` so a
+  stale/mismatched pubkey on a node can't silently consume the one
+  allowed password prompt.
 - v7: clarified out-of-place vs. in-place busbw columns in nccl-tests
   output — NV's acceptance spec targets the **out-of-place** column, and
   the ~870-930 GB/s figures flagged earlier in this doc were already that
@@ -463,6 +484,13 @@ the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
   not re-run per rack or per deploy. Bumping the pinned NCCL/nccl-tests
   tags or the Open MPI version means rebuilding this image and
   re-extracting a new `nccl-test-pack-arm64.tar.gz`.
+- **The pack is not fully hermetic**: `lib/` ships everything the pack's
+  own components need from each other, but four libraries the binaries
+  still require are *not* shipped and are expected to already exist on
+  the target node (see "Shared library audit" below for the full
+  breakdown). This has held up fine on every rack so far because they're
+  all base-OS libraries present on essentially any glibc Linux — but it
+  means "no OS package dependency" isn't literally true today.
 
 ## Operational findings
 
@@ -796,3 +824,118 @@ apt/package access" principle behind this whole deployment (see
 "Why not a container at test time" above), a written config file that
 travels with the preflight logic is the approach that works everywhere,
 including at a customer site with no package access.
+
+### `CUDA-capable device(s) is/are busy or unavailable` + TCP connect cascade
+
+Observed after an aborted run (in this case, mid-debug while iterating on
+the PMIx fix above) — the next attempt failed partway through All-to-All:
+
+```
+root: Test CUDA failure common.cu:1304 'CUDA-capable device(s) is/are busy or unavailable'
+ .. root pid 100504: Test failure common.cu:1189
+--------------------------------------------------------------------------
+WARNING: Open MPI failed to TCP connect to a peer MPI process. ...
+  Message:    connect() to 192.168.13.192:1027 failed
+  Error:      Operation now in progress (115)
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status ...
+```
+
+**Root cause:** a stale `all_reduce_perf`/`alltoall_perf`/`orted`/`mpirun`
+process from the previously-aborted run was still holding a CUDA context
+on one GPU on one node. **The TCP connect warnings are tear-down noise,
+not the root cause** — `mpirun` aborts the *entire* job the instant any
+single rank fails, so every other rank's in-flight PMIx/TCP handshake for
+the collective gets abandoned mid-connect, and the resulting warnings can
+point at a completely different, innocent rank than the one actually
+holding the stale GPU context. Don't chase the TCP messages; find the
+stale process instead:
+
+```bash
+for ip in "${CM_IPS[@]}"; do
+  ssh root@${ip} "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader"
+done
+```
+
+If `nvidia-smi` comes back clean on every node instead, treat it as a
+possible driver/fabric issue rather than a stale process — check
+`dmesg | grep -i xid` on the affected node.
+
+**Fix shipped in deploy script v0.15:** the per-node pre-flight loop
+(the same one handling `nvidia-imex`/`channel0`/PMIx above) now also
+checks for and kills any stale `all_reduce_perf`/`alltoall_perf`/`orted`/
+`mpirun` process on every node before every run, and fails loudly (rather
+than retrying blindly) if a process survives `kill -9`, since that
+usually means an actually-wedged GPU rather than a simple stale process:
+
+```
+STALE_PIDS=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
+  | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun' | awk -F',' '{print $1}')
+if [[ -n "$STALE_PIDS" ]]; then
+  kill -9 $STALE_PIDS 2>/dev/null || true
+  sleep 2
+  # ... re-check, exit 1 with a dmesg/xid hint if anything survived
+fi
+```
+
+### `--bootstrap` hardening (v0.14)
+
+Two small but important fixes to the first-time password-auth SSH key
+seeding (see "SSH trust bootstrap" above):
+
+- The `sshpass` SSH call is now wrapped in `timeout 15`, so one
+  unreachable node can't stall the whole bootstrap loop.
+- `-o PreferredAuthentications=password -o PubkeyAuthentication=no` is
+  now forced. Without this, if a node already has some stale or
+  mismatched key on file, OpenSSH tries pubkey auth first — and combined
+  with `NumberOfPasswordPrompts=1`, that can consume the one allowed
+  prompt before password auth is ever attempted, failing bootstrap
+  silently even with the correct password.
+
+### Shared library audit — what's in `lib/` vs. what the binaries actually need
+
+Confirmed by extracting `nccl-test-pack-arm64.tar.gz` and reading every
+shipped binary's dynamic section with `readelf -d` (works cross-arch —
+no need to execute an aarch64 binary on an x86 box to read its ELF
+metadata). None of the pack's binaries carry an embedded RPATH/RUNPATH,
+so this pack is 100% dependent on `LD_LIBRARY_PATH=$PACK_DIR/lib`, which
+`run_nccl_test.sh` sets — consistent with the design, not an issue.
+
+**Correctly shipped in `lib/`** (everything the pack's own components
+need from each other): `libcudart.so.13`, `libnccl.so.2`, `libmpi.so.40`,
+`libopen-rte.so.40`, `libopen-pal.so.40`, `libevent_core-2.1.so.7`,
+`libevent_pthreads-2.1.so.7`, `libhwloc.so.15`, `libpmix.so.2`,
+`libmunge.so.2`.
+
+**Required but NOT shipped** — silently relied on from the target node:
+
+| Library | Required by |
+|---|---|
+| `libstdc++.so.6` | every `*_perf` test binary, plus `libnccl.so.2` and `libcudart.so.13` themselves |
+| `libgcc_s.so.1` | same set |
+| `libz.so.1` | `libopen-rte.so.40` |
+| `libudev.so.1` | `libhwloc.so.15` |
+
+This hasn't caused a failure on any rack run so far — these are all
+base-OS libraries present on virtually any glibc Linux distro, so the
+dynamic linker resolves them from the target's own system paths without
+issue. Worth knowing as an implicit floor, though, if this pack is ever
+pointed at a genuinely minimal/embedded base image rather than a
+standard Ubuntu install.
+
+**This also corrects the assumed root cause of the PMIx compression
+warning** documented above. If the rack's OS truly lacked `zlib`/`libz`
+outright, `libopen-rte.so.40` couldn't resolve `libz.so.1` at load time
+and `mpirun` would fail to start at all — not print a soft PMIx warning
+and then run the entire test successfully, which is what was actually
+observed. `libz.so.1` clearly resolves fine on that rack. So the more
+likely explanation is that **this pack's PMIx build simply didn't have
+its zlib-backed `pcompress` component enabled at compile time** — a
+build-time choice baked into this pack, not a missing OS package on the
+rack. The `/root/.pmix/mca-params.conf` fix (deploy script v0.13+)
+remains correct and necessary either way; only the *why* changes.
+
+One other data point from the audit, unrelated to the missing libs:
+`all_reduce_perf` requires `GLIBC_2.38` (glibc ≈2023-era) — not a
+concern on any current Ubuntu release, but worth knowing as a base-OS
+version floor if this pack ever targets an older image.
