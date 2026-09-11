@@ -86,7 +86,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.18"
+SCRIPT_VERSION="0.19"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -741,6 +741,7 @@ run_one() {
     -x PATH="\$PACK_DIR/bin:\$PATH" \\
     -x LD_LIBRARY_PATH="\$PACK_DIR/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}" \\
     -x NCCL_DEBUG=WARN \\
+    -x NCCL_SOCKET_IFNAME=\$IFACE \\
     -x NCCL_MNNVL_ENABLE=2 \\
     -x NCCL_NVLS_ENABLE=1 \\
     -x NCCL_P2P_DISABLE=0 \\
