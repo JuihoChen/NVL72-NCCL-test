@@ -86,7 +86,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.15"
+SCRIPT_VERSION="0.17"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -270,9 +270,9 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
           -o PubkeyAuthentication=no \
           -o ConnectTimeout=8 \
           "root@${ip}" \
-          "mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
-           grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || \
-           echo '${PUBKEY}' >> /root/.ssh/authorized_keys && \
+          "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && \
+           { cat /root/.ssh/authorized_keys; echo '${PUBKEY}'; } | awk '!seen[\$0]++' > /root/.ssh/authorized_keys.tmp && \
+           mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys && \
            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
         echo "  [${ip}] key seeded OK"
       else
@@ -370,11 +370,162 @@ if [[ $DRY_RUN -eq 1 ]]; then
 else
   PUBKEY=$(ssh $SSH_OPTS "root@${NODE00}" "cat /root/.ssh/id_ed25519.pub")
   for ip in "${NODES[@]}"; do
-    ssh_do "$ip" "mkdir -p /root/.ssh && grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys"
+    ssh_do "$ip" "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && { cat /root/.ssh/authorized_keys; echo '${PUBKEY}'; } | awk '!seen[\$0]++' > /root/.ssh/authorized_keys.tmp && mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
   done
 fi
 
-echo "--- [3/4] Staging run_nccl_test.sh on node-00 ---"
+echo "--- [2b/4] Verifying node-00 -> sibling SSH (this is what mpirun actually uses --"
+echo "    the push above only proves the key was written, not that node-00 can reach"
+echo "    every peer with it) ---"
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "[DRY-RUN] would verify node-00 ($NODE00) can passwordlessly SSH to all ${#NODES[@]} node(s)"
+else
+  if MESH_CHECK=$(ssh_script "$NODE00" <<EOF
+FAILED=""
+for ip in ${NODES[@]}; do
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "root@\$ip" true 2>/dev/null || FAILED="\$FAILED \$ip"
+done
+if [[ -n "\$FAILED" ]]; then
+  echo "FAILED:\$FAILED"
+  exit 1
+fi
+echo "OK"
+EOF
+  ); then
+    echo "    node-00 -> all ${#NODES[@]} siblings: OK"
+  else
+    echo "" >&2
+    echo "ERROR: node-00 ($NODE00) cannot passwordlessly SSH to one or more siblings" >&2
+    echo "       (${MESH_CHECK#FAILED:}), even though the key push above reported success." >&2
+    echo "       mpirun launches node-00 -> siblings directly using node-00's OWN SSH" >&2
+    echo "       client -- left unfixed, this will hang silently at test time instead" >&2
+    echo "       of prompting (BatchMode, no TTY)." >&2
+    echo "       This usually means node-00's own key didn't actually propagate (e.g. a" >&2
+    echo "       stale/empty id_ed25519 on node-00 that the existing-file guard skipped" >&2
+    echo "       regenerating) -- not a jumper-side SSH problem, since the push itself" >&2
+    echo "       reported no error." >&2
+    exit 1
+  fi
+fi
+
+echo "--- [3/4] Staging run_nccl_test.sh + repair_ssh_mesh.sh on node-00 ---"
+
+# repair_ssh_mesh.sh: standalone trust/pack-repair utility, run directly on
+# node-00 (never via the jumper -- that's the point of splitting it out).
+# This is the ONLY file in this pack that ever imports sshpass or handles a
+# password. run_nccl_test.sh stays password-free; on a mesh failure it just
+# names this script rather than trying to repair anything itself.
+#
+#   bash repair_ssh_mesh.sh                                  # check only, no-op if healthy
+#   bash repair_ssh_mesh.sh --bootstrap <password>            # repair unreachable siblings
+#   bash repair_ssh_mesh.sh --only <ip1,ip2> --bootstrap <pw> # a swapped node (same IP)
+#   bash repair_ssh_mesh.sh --only <ip> --bootstrap <pw> --redeploy  # also re-push the pack
+#
+# Reuses node-00's EXISTING keypair (from deploy-time [2/4]) -- never
+# generates a new one here. --redeploy re-copies the pack from node-00's own
+# local cache, so a field swap needs no jumper reachability at all.
+build_repair_script() {
+cat <<INNER
+#!/bin/bash
+set -e
+
+SSH_OPTS="${SSH_OPTS}"
+PACK_DIR="${PACK_DIR}"
+PACK_CACHE="${PACK_CACHE}"
+NODES=(
+$(for ip in "${NODES[@]}"; do printf '  "%s"\n' "$ip"; done)
+)
+
+ONLY_RAW=""
+BOOTSTRAP_PASS=""
+REDEPLOY=0
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --bootstrap) BOOTSTRAP_PASS="\$2"; shift 2 ;;
+    --only)      ONLY_RAW="\$2"; shift 2 ;;
+    --redeploy)  REDEPLOY=1; shift ;;
+    -h|--help)
+      echo "Usage: \$0 [--only ip1,ip2] [--bootstrap <password>] [--redeploy]"
+      echo "  no args        : check node-00 -> every sibling, report only"
+      echo "  --bootstrap PW  : repair (sshpass-push node-00's OWN existing key to) any"
+      echo "                    unreachable node(s)"
+      echo "  --only ip1,ip2  : limit the check/repair to specific IP(s) (e.g. a swapped node)"
+      echo "  --redeploy      : also re-copy the pack tarball from node-00's local cache"
+      echo "                    to the targeted node(s) -- no jumper reachability needed"
+      exit 0
+      ;;
+    *) echo "Unknown arg: \$1" >&2; exit 1 ;;
+  esac
+done
+
+TARGETS=("\${NODES[@]}")
+if [[ -n "\$ONLY_RAW" ]]; then
+  IFS=',' read -ra TARGETS <<< "\$ONLY_RAW"
+  for ip in "\${TARGETS[@]}"; do
+    printf '%s\\n' "\${NODES[@]}" | grep -qx "\$ip" || {
+      echo "ERROR: \$ip is not in this rack's known IP list." >&2
+      echo "       A genuinely NEW IP needs CM_IPS updated in rackXX.sh and a fresh" >&2
+      echo "       deploy from the jumper -- this script only handles a same-IP swap." >&2
+      exit 1
+    }
+  done
+fi
+
+echo "=== Checking node-00 -> \${#TARGETS[@]} target node(s) ==="
+BROKEN=()
+for ip in "\${TARGETS[@]}"; do
+  ssh -o BatchMode=yes \$SSH_OPTS "root@\${ip}" true 2>/dev/null || BROKEN+=("\$ip")
+done
+
+if [[ \${#BROKEN[@]} -eq 0 ]]; then
+  echo "All \${#TARGETS[@]} target node(s) already reachable -- no repair needed."
+else
+  echo "Unreachable: \${BROKEN[*]}"
+  if [[ -z "\$BOOTSTRAP_PASS" ]]; then
+    echo "ERROR: \${#BROKEN[@]} node(s) unreachable and no --bootstrap <password> given." >&2
+    exit 1
+  fi
+  if ! command -v sshpass &>/dev/null; then
+    echo "ERROR: sshpass not found -- this pack build didn't ship it." >&2
+    exit 1
+  fi
+  MYPUB="\$(cat /root/.ssh/id_ed25519.pub)"
+  FAILED=()
+  for ip in "\${BROKEN[@]}"; do
+    if timeout 15 sshpass -p "\$BOOTSTRAP_PASS" ssh \\
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \\
+        -o NumberOfPasswordPrompts=1 -o PreferredAuthentications=password -o PubkeyAuthentication=no \\
+        -o ConnectTimeout=8 "root@\${ip}" \\
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && \\
+         { cat /root/.ssh/authorized_keys; echo '\${MYPUB}'; } | awk '!seen[\\\$0]++' > /root/.ssh/authorized_keys.tmp && \\
+         mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys && \\
+         chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+      echo "  [\$ip] trust repaired"
+    else
+      echo "  [\$ip] FAILED -- wrong password, unreachable, or password auth disabled?" >&2
+      FAILED+=("\$ip")
+    fi
+  done
+  if [[ \${#FAILED[@]} -gt 0 ]]; then
+    echo "ERROR: repair failed for: \${FAILED[*]}" >&2
+    exit 1
+  fi
+fi
+
+if [[ \$REDEPLOY -eq 1 ]]; then
+  echo "=== Redeploying pack to target node(s) from node-00's local cache ==="
+  [[ -f "\$PACK_CACHE" ]] || { echo "ERROR: no local pack cache at \$PACK_CACHE on node-00" >&2; exit 1; }
+  for ip in "\${TARGETS[@]}"; do
+    ssh \$SSH_OPTS "root@\${ip}" "mkdir -p \$PACK_DIR"
+    scp \$SSH_OPTS "\$PACK_CACHE" "root@\${ip}:\$PACK_CACHE"
+    ssh \$SSH_OPTS "root@\${ip}" "tar xzf \$PACK_CACHE -C \$PACK_DIR"
+    echo "  [\$ip] pack redeployed"
+  done
+fi
+
+echo "=== Repair complete ==="
+INNER
+}
 
 # mpirun's hostfile IS the IMEX node list (same convention as the
 # reference diag log: --hostfile /etc/nvidia-imex/nodes_config.cfg).
@@ -431,6 +582,25 @@ RUN_GPUS=\$(( NODES_REQUESTED * ${GPUS_PER_NODE} ))
 RUN_HOSTFILE="${RUN_DIR}/hostfile_\${NODES_REQUESTED}node.cfg"
 printf '%s\\n' "\${NODES[@]:0:\$NODES_REQUESTED}" > "\$RUN_HOSTFILE"
 echo "Test scope: \$NODES_REQUESTED node(s) / \$RUN_GPUS GPUs (\$RUN_HOSTFILE)"
+
+echo "=== Checking node-00 -> \${#NODES[@]} sibling(s) over SSH (this is what mpirun uses) ==="
+MESH_BROKEN=()
+for ip in "\${NODES[@]}"; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 \$SSH_OPTS "root@\${ip}" true 2>/dev/null || MESH_BROKEN+=("\$ip")
+done
+if [[ \${#MESH_BROKEN[@]} -gt 0 ]]; then
+  echo "" >&2
+  echo "ERROR: node-00 cannot passwordlessly SSH to \${#MESH_BROKEN[@]} node(s):" >&2
+  printf '  %s\\n' "\${MESH_BROKEN[@]}" >&2
+  echo "" >&2
+  echo "This can happen after a reboot/reimage on this hardware -- the mesh doesn't" >&2
+  echo "always survive it. Run, ON node-00:" >&2
+  echo "  bash \$(dirname "\$0")/repair_ssh_mesh.sh --bootstrap <password>" >&2
+  echo "then retry this script. (mpirun would otherwise hang silently here with no" >&2
+  echo "way to prompt for a password.)" >&2
+  exit 1
+fi
+echo "    node-00 -> all \${#NODES[@]} siblings: OK"
 
 echo "=== Pre-flight: checking nvidia-imex + channel0 + pack on \${#NODES[@]} node(s) ==="
 for ip in "\${NODES[@]}"; do
@@ -595,9 +765,11 @@ INNER
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[DRY-RUN] would push run_nccl_test.sh (NCCL_MNNVL_UUID=${MNNVL_UUID}, pack persisted under ${DATA_DIR}, pre-flight over ${#NODES[@]} nodes) to root@${NODE00}:${RUN_DIR}/run_nccl_test.sh"
+  echo "[DRY-RUN] would push repair_ssh_mesh.sh to root@${NODE00}:${RUN_DIR}/repair_ssh_mesh.sh"
 else
   ssh $SSH_OPTS "root@${NODE00}" "mkdir -p ${RUN_DIR}"
   build_run_script | ssh $SSH_OPTS "root@${NODE00}" "cat > ${RUN_DIR}/run_nccl_test.sh && chmod +x ${RUN_DIR}/run_nccl_test.sh"
+  build_repair_script | ssh $SSH_OPTS "root@${NODE00}" "cat > ${RUN_DIR}/repair_ssh_mesh.sh && chmod +x ${RUN_DIR}/repair_ssh_mesh.sh"
 fi
 
 echo ""
@@ -626,5 +798,11 @@ Next: ssh root@${NODE00} then 'bash ${RUN_DIR}/run_nccl_test.sh'
       Optional node-count arg (whole nodes, default = full rack):
         bash ${RUN_DIR}/run_nccl_test.sh             # full rack (${#NODES[@]} nodes / ${TOTAL_RANKS} GPUs)
         bash ${RUN_DIR}/run_nccl_test.sh ${HALF_NODES}              # half rack (${HALF_NODES} nodes / $((HALF_NODES * GPUS_PER_NODE)) GPUs)
+
+      Also staged: ${RUN_DIR}/repair_ssh_mesh.sh -- run this ON node-00 (not
+      from the jumper) if run_nccl_test.sh reports a broken node-00 -> sibling
+      mesh, or after swapping a node in the field at the same IP:
+        bash ${RUN_DIR}/repair_ssh_mesh.sh --bootstrap <password>
+        bash ${RUN_DIR}/repair_ssh_mesh.sh --only <ip> --bootstrap <password> --redeploy
 MSG
 fi

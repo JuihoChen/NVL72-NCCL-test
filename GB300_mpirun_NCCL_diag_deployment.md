@@ -1,6 +1,22 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v9** (2026-07-20)
+**Doc version: v10** (2026-07-30)
+- v10: deploy script v0.16/v0.17 corrects and hardens the SSH trust design
+  after live testing surfaced three real gaps: (1) `--bootstrap` seeds the
+  **jumper's** own key, not node-00's — the doc previously described this
+  incorrectly; node-00's own key mesh is a separate step (`[2/4]`) that was
+  never verified to have actually worked, so a new `[2b/4]` has node-00
+  test SSH to every sibling itself, right after the push, before staging
+  anything; (2) the node-00→sibling mesh does **not** reliably survive
+  reboot/reimage on this hardware (confirmed via a live customer-site
+  transcript — 17 of 18 siblings needed a password after shipping, while
+  node-00's own self-entry didn't), so `run_nccl_test.sh` now runs the same
+  check itself before every test and fails fast with a clear pointer
+  instead of hanging silently at `mpirun`; (3) `authorized_keys` on at
+  least one node was found with duplicate key lines from a non-atomic
+  check-then-append pattern — replaced with a dedupe-on-write everywhere
+  the pack touches that file. See "SSH trust bootstrap" (updated) below
+  for the full design and the current recommendation on `repair_ssh_mesh.sh`.
 - v9: added a shared-library audit of `nccl-test-pack-arm64.tar.gz`'s
   `lib/` folder against every binary's actual `DT_NEEDED` entries
   (`readelf -d`, cross-arch-safe) — confirms what's correctly shipped,
@@ -77,7 +93,11 @@ either.
   the script reverses it so index 0 ("IP0") is **node-00**, the lowest IP,
   used as the mpirun launch node.
 - **node-00**: the launch/anchor node. After deploy, it holds
-  `run_nccl_test.sh` and has passwordless root SSH to every sibling.
+  `run_nccl_test.sh` (and `repair_ssh_mesh.sh`, see "SSH trust bootstrap"
+  below) and has passwordless root SSH to every sibling — though this mesh
+  is not guaranteed to survive a reboot/reimage on this hardware; both
+  scripts check for that and self-heal or point at the fix rather than
+  assuming it's still intact.
 
 ## Why not a container at test time
 
@@ -286,13 +306,18 @@ One script, one rack file as its argument:
    — e.g. after a hardware swap — without re-touching the rest of the
    rack; if node-00 itself is in that list, the script falls back to a
    full pass.
-2. **SSH key meshing** — node-00 generates a keypair (if it doesn't have
-   one) and gets it appended to every sibling's `authorized_keys`. mpirun
-   launches node→node (not jumper→node), and this same mesh is what lets
-   node-00 run the pre-flight (below) against every sibling at test time.
-3. **Staging** — generates and pushes `run_nccl_test.sh` onto node-00 at
-   `/root/portable-nccl/run/run_nccl_test.sh`. By the time deploy
-   finishes, node-00 is fully ready — no second script needed.
+2. **SSH key meshing, in two parts** — `[2/4]` generates node-00's own
+   keypair (if it doesn't have one) and pushes it to every sibling's
+   `authorized_keys`; `[2b/4]` then has **node-00 itself** test SSH to
+   every sibling (`BatchMode=yes`) before proceeding, so a broken push is
+   caught here rather than surfacing as a silent `mpirun` hang later. This
+   is the mesh mpirun actually uses (node→node, not jumper→node) — see
+   "SSH trust bootstrap" below for the full design, including why this
+   mesh needs re-verifying at test time too, not just at deploy time.
+3. **Staging** — generates and pushes `run_nccl_test.sh` **and**
+   `repair_ssh_mesh.sh` onto node-00, under
+   `/root/portable-nccl/run/`. By the time deploy finishes, node-00 is
+   fully ready — no second script needed for a normal run.
 4. **(optional `--auto`)** — SSHes into node-00 and runs it immediately.
 
 `NCCL_MNNVL_UUID` is auto-derived from the rack filename if not given
@@ -309,10 +334,18 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 
 ### Pre-flight (every single invocation, against every node)
 
-Two things get checked — and repaired if needed — every time this runs,
-not just once at deploy time:
+Three things get checked — and repaired if possible — every time this
+runs, not just once at deploy time:
 
-1. **`nvidia-imex` / `channel0`** — `channel0` is a kernel-driver-backed
+1. **node-00 → sibling SSH mesh** — checked first, before anything else,
+   since a broken mesh here means every other check below would just hang
+   instead of failing cleanly. Same `BatchMode=yes` check as `[2b/4]` at
+   deploy time, run again because **this mesh does not reliably survive a
+   reboot/reimage on this hardware** (see "SSH trust bootstrap" below for
+   the confirming evidence). On failure, exits immediately with a pointer
+   to `repair_ssh_mesh.sh` rather than proceeding into a silent `mpirun`
+   hang with no way to prompt for a password (`BatchMode`, no TTY).
+2. **`nvidia-imex` / `channel0`** — `channel0` is a kernel-driver-backed
    `/dev` node created with a manual `mknod`, not a persistent udev rule.
    It is recreated fresh on every boot, on every system, unconditionally —
    there is no way to make this survive a reboot, so it must be re-checked
@@ -328,7 +361,7 @@ not just once at deploy time:
      chmod 0666 /dev/nvidia-caps-imex-channels/channel0
    fi
    ```
-2. **Pack presence (safety net only)** — the pack *does* persist across
+3. **Pack presence (safety net only)** — the pack *does* persist across
    reboots (it's a plain file on local disk, not tmpfs), so this is
    normally a no-op. If somehow missing/incomplete, it's re-extracted from
    the **locally cached** `.tar.gz` — no network round-trip needed.
@@ -415,9 +448,14 @@ everything.
   mesh and staging).
 - If a replacement node gets a **new IP**, update `CM_IPS` in the rack's
   `rackXX.sh` file first — everything else is driven off that array.
-- **No redeploy needed after a reboot, ever** — `nvidia-imex`/`channel0`
-  self-heal on every test invocation by design; the pack persists on local
-  disk and isn't affected by reboots at all.
+- **`nvidia-imex`/`channel0` self-heal on every test invocation by
+  design** — no redeploy needed for those specifically after a reboot;
+  the pack persists on local disk and isn't affected by reboots at all.
+- **The SSH mesh is a different story** — it does not reliably survive
+  every reboot/reimage on this hardware. `run_nccl_test.sh` checks for
+  this itself (first pre-flight step, above) and points at
+  `repair_ssh_mesh.sh` rather than silently hanging; see "SSH trust
+  bootstrap" below for the full design and current recommendation.
 
 ## Usage
 
@@ -444,6 +482,13 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 # After swapping one node, redeploy just that node
 ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.191
 
+# If run_nccl_test.sh reports a broken node-00 -> sibling mesh (e.g. after
+# a reboot in transit), run this ON node-00 -- not from the jumper:
+bash /root/portable-nccl/run/repair_ssh_mesh.sh --bootstrap <password>
+# scoped to one node, and also re-push the pack (a field same-IP swap
+# with no jumper reachability needed):
+bash /root/portable-nccl/run/repair_ssh_mesh.sh --only 192.168.14.191 --bootstrap <password> --redeploy
+
 # Whole fleet, one rack at a time
 ./test_all_racks.sh                 # all rack*.sh next to the scripts
 ./test_all_racks.sh --auto          # unattended, runs mpirun on every rack too
@@ -453,9 +498,10 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 
 | File | Purpose |
 |---|---|
-| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.9**. |
+| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh + verify, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.17**. |
 | `test_all_racks.sh` | Thin loop over every `rackXX.sh` found next to it, calling `deploy_rack_nccl_test.sh` per rack and writing a pass/fail summary under `results/`. |
 | `nccl_arm64.Dockerfile` | One-off build recipe for the pack's contents (Slurm-free Open MPI 4.1.6 + pinned NCCL v2.28.7-1 + nccl-tests v2.17.8). Built once, not part of the per-rack deploy pipeline; its `/usr/local` + `/var/nccl-tests/build` output is copied out and `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. |
+| `repair_ssh_mesh.sh` | Staged onto node-00 alongside `run_nccl_test.sh`. Standalone node-00 → sibling SSH trust (and, with `--redeploy`, pack) repair utility — the only file in this pack that ever imports `sshpass` or handles a password. See "SSH trust bootstrap" below, including the current recommendation on whether to keep this vs. relying on jumper-side redeploy. |
 
 Both expect to live in the same directory as the rack inventory files and
 the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
@@ -663,12 +709,24 @@ cause incompatibility during NVLink Recovery operations.
 
 ### SSH trust bootstrap — first-time rack deployment (`--bootstrap`)
 
-On a freshly imaged rack, no node has node-00's SSH public key in its
+On a freshly imaged rack, no node has any of this pipeline's keys in its
 `/root/.ssh/authorized_keys` yet — a chicken-and-egg problem: the deploy
-script meshes keys node-00 → siblings, but can't reach siblings without a
-key already in place.
+script needs to mesh node-00's key to every sibling, but can't reach any
+node at all without some key already in place.
 
-**Symptom** in `run_nccl_test.sh` output:
+**Correction from earlier doc versions:** `--bootstrap` seeds the
+**jumper's own** SSH public key (whatever's in the jumper's local
+`/root/.ssh/id_ed25519.pub`), not node-00's. This isn't a bug — the jumper
+can't fetch a key from node-00 before any trust exists at all, so
+bootstrapping necessarily uses whatever key is already local to the
+machine invoking the script. Node-00's *own* key is a separate step
+(`[2/4]`, below), which happens automatically in the same invocation, but
+is worth understanding as functionally distinct: the jumper's key gets
+the jumper into every node (used by `[0/4]` preflight and pack
+distribution); node-00's key is what `mpirun` actually uses at test time,
+launching node→node, not jumper→node.
+
+**Symptom** in `run_nccl_test.sh` output when neither key is present:
 ```
 root@192.168.14.154's password:
 root@192.168.14.152's password:
@@ -680,26 +738,21 @@ The pre-flight can prompt interactively for missing-key nodes; `mpirun`
 cannot (BatchMode) — it silently hangs waiting for the missing ranks to
 join the collective barrier.
 
-**Resolution: run `--bootstrap` once on first deployment:**
+**Resolution: run `--bootstrap` once on first deployment, from the jumper:**
 ```bash
 ./deploy_rack_nccl_test.sh rack01.sh --bootstrap
 ```
 
-Added in v0.9. Seeds node-00's public key to every node via password SSH
-using `sshpass`, then immediately continues into the normal deploy.
-Requires `sshpass` (`apt-get install -y sshpass`).
-
-**What it does per node:**
-- Creates `/root/.ssh/` with `700` permissions if missing
-- Appends node-00's public key to `authorized_keys` — idempotent (no
-  duplicates if already present)
-- Sets `authorized_keys` to `600`
-- Reports `OK` or `FAILED` per IP, exits on any failure before deploying
+Seeds the jumper's key to every node via password SSH using `sshpass`,
+then continues into the normal deploy — `[0/4]` preflight, `[1/4]` pack
+distribution, `[2/4]` node-00's own key mesh, `[2b/4]` verification (see
+below), `[3/4]` staging. Requires `sshpass` on the jumper
+(`apt-get install -y sshpass`).
 
 **The root password** is the Linux root account password set during OS
 imaging — typically a site-wide default shared across all 18 nodes on a
 fresh rack. Nodes that don't match are reported as `FAILED` for manual
-follow-up via `ssh-copy-id root@<ip>`.
+follow-up.
 
 **Full first-time lifecycle:**
 ```
@@ -708,18 +761,119 @@ Fresh rack (no SSH trust)
         v
 ./deploy_rack_nccl_test.sh rack01.sh --bootstrap
   -> prompts once for root password
-  -> seeds node-00's key to all 18 nodes
-  -> continues with normal deploy [0/4] -> [1/4] -> [2/4] -> [3/4]
-        |
-        v
-All future runs -- no --bootstrap needed
-./deploy_rack_nccl_test.sh rack01.sh
-  -> [0/4] preflight confirms all nodes passwordlessly reachable
-  -> [2/4] mesh re-syncs key after any node swap
+  -> seeds the JUMPER's key to all 18 nodes
+  -> [0/4] preflight confirms jumper -> all nodes
+  -> [1/4] pack distribution
+  -> [2/4] generates/pushes NODE-00's OWN key to all 18 nodes
+  -> [2b/4] node-00 itself verifies it can reach all 18 siblings
+  -> [3/4] stages run_nccl_test.sh + repair_ssh_mesh.sh on node-00
 ```
 
-Re-run `--bootstrap` only if a node is **reimaged from scratch** (wiping
-its `authorized_keys`); the `[0/4]` preflight will flag it first.
+### `[2b/4]` node-00 → sibling mesh verification (v0.16)
+
+`[2/4]` only proved the key *push* succeeded (no SSH error), not that
+node-00 could actually *use* it — those are different things, and a gap
+between them is exactly what let a broken mesh go undetected until
+`mpirun` hung, in practice. `[2b/4]` closes that gap: right after `[2/4]`,
+the jumper has **node-00 itself** attempt a `BatchMode=yes` SSH to every
+sibling, and fails the whole deploy loudly if any don't respond —
+*before* `run_nccl_test.sh`/`repair_ssh_mesh.sh` are even staged.
+
+### The mesh doesn't reliably survive reboot/reimage — confirmed live
+
+A production-line deploy completed cleanly (bootstrap + `[2/4]` + `[2b/4]`
+all passed). At the customer site, later, `run_nccl_test.sh` needed the
+root password **36 times** (18 siblings × 2 SSH calls each in the
+pre-flight loop) and then hung indefinitely at `mpirun`:
+```
+root@192.168.43.154's password:
+root@192.168.43.154's password:
+...
+Warning: Permanently added '192.168.43.153' (ED25519) to the list of known hosts.
+root@192.168.43.153's password:
+...
+=== Pre-flight complete ===
+--- All-Reduce (72 GPUs) ---
+<hangs -- no further output>
+```
+Every one of the 17 siblings needed a password; node-00's own self-entry
+did not. That asymmetry rules out "the mesh push never worked" (deploy
+had already verified it did, via `[2b/4]`) in favor of **something
+between deploy and test — reboot, power cycle in transit, a reimage step
+— resets sibling `authorized_keys` state without touching node-00's own**.
+This is the same class of state loss already documented for
+`nvidia-imex`/`channel0` ("lost on last reboot, as expected") — the root
+cause of the *loss itself* is outside these scripts (site
+provisioning/reimaging), not something deploy-time code can prevent.
+
+**Because of this, `run_nccl_test.sh` now runs its own copy of the
+`[2b/4]` check first, every invocation**, and fails fast with a pointer
+to `repair_ssh_mesh.sh` instead of the 36-password/silent-hang sequence
+above (see "Pre-flight" above).
+
+### `repair_ssh_mesh.sh` — standalone node-00 trust/pack repair
+
+Staged onto node-00 alongside `run_nccl_test.sh`. Kept as a **separate
+file** rather than a flag on `run_nccl_test.sh` deliberately: it's the
+only file in this pack that ever imports `sshpass` or sees a password, so
+"does this script ever handle a credential" stays answerable by filename
+alone. Reuses node-00's **existing** keypair (from `[2/4]`) — never
+generates a new one.
+
+```bash
+# check only, no-op if the mesh is already healthy:
+bash repair_ssh_mesh.sh
+# repair whichever sibling(s) fail the check:
+bash repair_ssh_mesh.sh --bootstrap <password>
+# scope to a specific node (e.g. a field same-IP swap):
+bash repair_ssh_mesh.sh --only <ip> --bootstrap <password>
+# also re-push the pack from node-00's local cache -- no jumper
+# reachability needed at all:
+bash repair_ssh_mesh.sh --only <ip> --bootstrap <password> --redeploy
+```
+
+An unrecognized IP passed to `--only` is rejected rather than guessed at
+— a genuinely new IP (not a same-IP swap) needs `CM_IPS` updated in
+`rackXX.sh` and a fresh deploy from the jumper.
+
+**Current recommendation for this fleet:** this deployment's jumper is
+confirmed always network-reachable to every rack, for the rack's whole
+life — no disconnected field/customer sites where the jumper can't reach
+it. Given that, `repair_ssh_mesh.sh` is **functionally redundant** with
+simply re-running `./deploy_rack_nccl_test.sh rackXX.sh --bootstrap
+<password>` from the jumper, which fixes the same underlying problem via
+`[2/4]`/`[2b/4]` and needs no `sshpass` bundled into the pack at all. The
+tradeoff being weighed is scope/speed (`repair_ssh_mesh.sh --only <ip>`
+fixes one node without re-touching the other 17) against one fewer file,
+one fewer code path, and one fewer place a password ever needs to exist
+on node-00. Not yet decided — pending the diag team's input on whether
+that speed difference matters enough in practice to keep both paths.
+
+### Duplicate `authorized_keys` entries — dedupe-on-write (v0.17)
+
+A live node's `authorized_keys` was found with **duplicate** copies of
+node-00's key, interleaved with unrelated pre-existing factory/AE
+provisioning keys (`root@bu18-nv-ae-01`, `nv_ae@bu18-nv-ae-01` —
+something outside this pipeline re-seeds those independently; nothing
+here creates or manages them). Root cause: the original
+`grep -qxF ... || echo ... >>` check-then-append pattern isn't atomic and
+can be bypassed by a slightly different repeat invocation. v0.17 replaces
+it everywhere `authorized_keys` is touched (bootstrap, `[2/4]`,
+`repair_ssh_mesh.sh`'s push) with a dedupe-on-write:
+```bash
+{ cat /root/.ssh/authorized_keys; echo "$PUBKEY"; } \
+  | awk '!seen[$0]++' > /root/.ssh/authorized_keys.tmp \
+  && mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys \
+  && chmod 600 /root/.ssh/authorized_keys
+```
+Collapses any exact-duplicate line to one copy — including the
+pre-existing factory keys — without removing any identity's access.
+Validated end-to-end on a fresh rack03 deploy with zero manual password
+entry.
+
+Re-run `--bootstrap` (from the jumper) if a node is **reimaged from
+scratch** (wiping `authorized_keys` entirely); `[0/4]` preflight will
+flag it first.
 
 ### `[0/4]` preflight SSH key-check (v0.8+)
 
