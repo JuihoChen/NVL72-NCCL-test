@@ -80,7 +80,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.13"
+SCRIPT_VERSION="0.14"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -255,10 +255,22 @@ if [[ $BOOTSTRAP -eq 1 ]]; then
     fi
     BOOTSTRAP_FAIL=()
     for ip in "${NODES[@]}"; do
-      if sshpass -p "$RACK_PASS" ssh           -o StrictHostKeyChecking=no           -o UserKnownHostsFile=/dev/null           -o LogLevel=ERROR           -o NumberOfPasswordPrompts=1           -o ConnectTimeout=8           "root@${ip}"           "mkdir -p /root/.ssh && chmod 700 /root/.ssh &&            grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null ||            echo '${PUBKEY}' >> /root/.ssh/authorized_keys &&            chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
+      if timeout 15 sshpass -p "$RACK_PASS" ssh \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          -o LogLevel=ERROR \
+          -o NumberOfPasswordPrompts=1 \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -o ConnectTimeout=8 \
+          "root@${ip}" \
+          "mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
+           grep -qxF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || \
+           echo '${PUBKEY}' >> /root/.ssh/authorized_keys && \
+           chmod 600 /root/.ssh/authorized_keys" 2>/dev/null; then
         echo "  [${ip}] key seeded OK"
       else
-        echo "  [${ip}] FAILED -- wrong password or node unreachable?" >&2
+        echo "  [${ip}] FAILED -- wrong password, node unreachable, or password auth disabled?" >&2
         BOOTSTRAP_FAIL+=("$ip")
       fi
     done
@@ -289,7 +301,8 @@ if [[ $DRY_RUN -eq 0 ]]; then
       echo "  root@${ip}" >&2
     done
     echo "" >&2
-    echo "Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script." >&2
+    echo "Fix: re-run with --bootstrap [password] to seed the key, or" >&2
+    echo "     run 'ssh-copy-id root@<ip>' manually for each node above." >&2
     exit 1
   fi
   echo "    all nodes reachable -- OK"
