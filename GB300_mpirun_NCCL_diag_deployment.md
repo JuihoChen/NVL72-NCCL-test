@@ -1,6 +1,18 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v10** (2026-07-30)
+**Doc version: v12** (2026-08-03)
+- v12: updated the `NCCL_P2P_SCHEDULE_GROUP_SIZE=1` finding — NV reached
+  this recommendation by reviewing this rack's own
+  `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING,GRAPH,P2P` log, not a general
+  playbook suggestion. Supports (but doesn't fully confirm) the working
+  theory that this is a P2P group-scheduling knob affecting All-to-All's
+  send/recv-based implementation and not All-Reduce's algorithmic path.
+  Exact internal mechanism still unconfirmed — see the finding below.
+- v11: added `-x NCCL_P2P_SCHEDULE_GROUP_SIZE=1` to the `mpirun` invocation
+  per direct NVIDIA feedback — measured All-to-All bus bandwidth improved
+  from ~636 GB/s to ~670 GB/s at the top of the size sweep, with no
+  regression observed on All-Reduce. See "NV-recommended
+  `NCCL_P2P_SCHEDULE_GROUP_SIZE=1`" under Operational findings.
 - v10: deploy script v0.16/v0.17 corrects and hardens the SSH trust design
   after live testing surfaced three real gaps: (1) `--bootstrap` seeds the
   **jumper's** own key, not node-00's — the doc previously described this
@@ -390,6 +402,7 @@ export LD_LIBRARY_PATH="/root/portable-nccl/lib:/usr/local/cuda/lib64:$LD_LIBRAR
   -x NCCL_DEBUG=WARN -x NCCL_MNNVL_ENABLE=2 -x NCCL_NVLS_ENABLE=1 \
   -x NCCL_P2P_DISABLE=0 -x NCCL_IB_DISABLE=1 -x CUDA_IPC_HANDLE_SHARING_SUPPORT=1 \
   -x CUDA_DEVICE_MAX_CONNECTIONS=1 -x NCCL_MNNVL_UUID=0x17 -x NCCL_MIN_CTAS=32 \
+  -x NCCL_P2P_SCHEDULE_GROUP_SIZE=1 \
   /root/portable-nccl/bin/all_reduce_perf -b 8 -e 32G -f 2 -g 1
 ```
 
@@ -420,7 +433,8 @@ Notable points:
 A full run across an 18-node / 72-GPU rack completed cleanly: correct
 device mapping for all 72 ranks, **zero "out of bounds" / wrong values**
 across every message size tested, peak All-Reduce bus bandwidth ~927 GB/s
-at 32GB, peak All-to-All bus bandwidth ~636 GB/s at 34GB.
+at 32GB, peak All-to-All bus bandwidth **~670 GB/s** at 34GB (up from
+~636 GB/s — see "NV-recommended `NCCL_P2P_SCHEDULE_GROUP_SIZE=1`" below).
 
 A quick note on reading those numbers: nccl-tests reports both `algbw`
 (message size ÷ time) and `busbw` (`algbw × factor`, where the factor
@@ -898,6 +912,46 @@ Fix: run 'ssh-copy-id root@<ip>' for each node above, then re-run this script.
 this catches exactly the nodes that would cause a silent hang during the
 actual test. The check also runs after `--bootstrap` seeding to confirm
 the seed worked before proceeding with the deploy.
+
+### NV-recommended `NCCL_P2P_SCHEDULE_GROUP_SIZE=1` — All-to-All busbw improvement
+
+Per direct feedback from NVIDIA, `-x NCCL_P2P_SCHEDULE_GROUP_SIZE=1` was
+added to the `mpirun` invocation (see above). Measured effect on this
+rack: peak All-to-All bus bandwidth improved from ~636 GB/s to **~670
+GB/s** at the top of the size sweep, with no regression observed on
+All-Reduce (still ~927 GB/s peak).
+
+**How NV arrived at this:** by reviewing this rack's own
+`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING,GRAPH,P2P` log (the same
+subsystem set already used elsewhere in this doc for NVLS diagnosis) —
+this was a diagnosis from our actual trace, not a general playbook
+suggestion applied blind.
+
+**Working theory on the mechanism (unconfirmed by NV, inferred from NCCL's
+architecture):** All-Reduce and All-to-All take different code paths in
+NCCL. All-Reduce is a single fused collective (Ring/Tree/NVLS algorithm
+selected once per call). All-to-All, as implemented in `nccl-tests`, is
+not a native NCCL collective at all — it's a batch of individual
+`ncclSend`/`ncclRecv` calls (every rank to every other rank) wrapped in
+one `ncclGroupStart`/`ncclGroupEnd`, going through NCCL's generic
+point-to-point path. `NCCL_P2P_SCHEDULE_GROUP_SIZE` most plausibly
+controls how many of those grouped P2P operations get batched/scheduled
+together per round in that path — which would explain the asymmetry
+observed (a real effect on All-to-All's P2P-heavy path, none on
+All-Reduce's algorithmic path). **This is inference from NCCL's known
+architecture and the observed pattern, not a confirmed explanation from
+NVIDIA** — if/when NV shares what specifically in the `TUNING,GRAPH,P2P`
+log pointed them at this fix, replace this paragraph with their actual
+explanation.
+
+**Note on documentation:** as of this writing, `NCCL_P2P_SCHEDULE_GROUP_SIZE`
+does not appear in NVIDIA's public NCCL environment-variable reference —
+this is an NV-provided tuning recommendation for this workload/hardware
+combination, not a documented general-purpose knob. Treat it the same way
+as the other rack-specific env vars already in the invocation (e.g.
+`NCCL_MIN_CTAS=32`): validated empirically on this configuration, not
+guaranteed to generalize without re-testing if the pinned NCCL version,
+GPU count per node, or fabric topology changes.
 
 ### `Avg bus bandwidth` looking low — check per-size busbw, not the average
 

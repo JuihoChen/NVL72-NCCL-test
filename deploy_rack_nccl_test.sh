@@ -86,7 +86,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.17"
+SCRIPT_VERSION="0.18"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -749,6 +749,7 @@ run_one() {
     -x CUDA_DEVICE_MAX_CONNECTIONS=1 \\
     -x NCCL_MNNVL_UUID=${MNNVL_UUID} \\
     -x NCCL_MIN_CTAS=32 \\
+    -x NCCL_P2P_SCHEDULE_GROUP_SIZE=1 \\
     "\$bin_path" \$args
 }
 
