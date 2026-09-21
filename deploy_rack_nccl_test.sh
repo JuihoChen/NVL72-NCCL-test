@@ -83,10 +83,20 @@
 #     left unchecked, it fails the NEXT run with "CUDA-capable device(s)
 #     is/are busy or unavailable", often against a different, innocent
 #     rank than the one actually holding the stale GPU context
+#
+# v0.21: added --mca mca_base_component_show_load_errors 0 to the mpirun
+# invocation in run_one() (inside build_run_script). Silences OpenMPI's
+# "mca_base_component_repository_open: unable to open ... (ignored)"
+# startup noise for optional MCA plugins this pack's Open MPI build wasn't
+# compiled with (coll_sm, coll_monitoring, osc_ucx, osc_monitoring, etc.).
+# Cosmetic only -- NCCL does its own collectives over IB/NVLink and never
+# touches these; OpenMPI here is just the launcher/bootstrapper. This one
+# flag covers any missing optional component, present or future, instead
+# of hardcoding today's specific list of four.
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.19"
+SCRIPT_VERSION="0.21"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -149,10 +159,17 @@ DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 [[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found (checked cwd and $SCRIPT_DIR)" >&2; exit 1; }
 
 # Auto-derive NCCL_MNNVL_UUID from the rack filename if not explicitly given
+#
+# v0.20: force base-10 via 10#$RACK_NUM. Without it, bash's printf/arithmetic
+# treats a leading-zero numeric string as OCTAL, which either silently
+# mis-derives the UUID (e.g. "017" -> octal 17 -> decimal 15) or hard-fails
+# with "printf: invalid octal number" on any digit string containing 8/9
+# (e.g. rack IDs like 060629), killing the whole script under set -e before
+# the SSH mesh or node-00 resolution ever run.
 if [[ -z "$MNNVL_UUID" ]]; then
   RACK_NUM=$(basename "$RACK_FILE" .sh | grep -oE '[0-9]+' | head -1)
   if [[ -n "$RACK_NUM" ]]; then
-    MNNVL_UUID="0x$(printf '%02d' "$RACK_NUM")"
+    MNNVL_UUID="0x$(printf '%02d' "$((10#$RACK_NUM))")"
     echo "Auto-derived NCCL_MNNVL_UUID=${MNNVL_UUID} from rack filename (override with --uuid)"
   else
     MNNVL_UUID="0x0"
@@ -731,6 +748,7 @@ run_one() {
     --mca btl tcp,self \\
     --mca btl_tcp_if_include \$IFACE \\
     --mca coll_hcoll_enable 0 \\
+    --mca mca_base_component_show_load_errors 0 \\
     -np \$RUN_GPUS \\
     -N ${GPUS_PER_NODE} \\
     --hostfile \$RUN_HOSTFILE \\
