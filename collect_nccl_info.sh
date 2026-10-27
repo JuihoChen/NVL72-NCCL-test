@@ -1,15 +1,16 @@
 #!/bin/bash
 # collect_nccl_info.sh
 #
-# Run on the jumper (with the rack file) or ON node-00, after an INFO run
-# (NCCL_DEBUG=INFO with NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log). Pulls every node's
+# Run on the jumper (with the rack file) or ON node-00, after
+# 'run_nccl_test.sh --info' (NCCL_DEBUG=INFO with
+# NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log). Pulls every node's
 # /tmp/nccl_info/*.log back IN PARALLEL into one folder on node-00 and
 # packs it into a single .tar.gz, ready to copy off the rack for analysis
 # (into ./results/ next to this script, wherever it runs).
 # Collection only -- no analysis/ranking happens here.
 #
 # The per-rank files stay where they are on each node: /tmp is cleared at
-# reboot, and the next INFO run empties /tmp/nccl_info first, so nothing
+# reboot, and the next --info run empties /tmp/nccl_info first, so nothing
 # piles up across runs.
 #
 #   bash collect_nccl_info.sh rack17.sh            # on the jumper: nodes from CM_IPS
