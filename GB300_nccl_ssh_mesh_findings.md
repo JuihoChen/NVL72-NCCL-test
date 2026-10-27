@@ -1,6 +1,6 @@
 # GB300 NCCL Diag Rack — SSH Mesh Investigation Findings
 
-**Scope:** `deploy_rack_nccl_test.sh` / `run_nccl_test.sh`, v0.15 → v0.17
+**Scope:** `deploy_rack_nccl_test.sh` / `run_nccl_test.sh`, v0.15 → v0.21
 **Topology assumption confirmed for this fleet:** the jumper is always network-reachable
 to every node in a rack, for the life of the rack. No disconnected field/customer
 sites where the jumper cannot reach the rack at test time.
@@ -85,16 +85,18 @@ values the speed of a single-node fix over the small maintenance cost of a
 second script — worth asking them directly rather than deciding unilaterally,
 since they're the ones operating it.
 
+**Decision (2026-10-27): A.** `repair_ssh_mesh.sh` has never been used in
+practice because the deploy script's own mesh handling works reliably.
+The script change itself is still pending (see open items).
+
 ## 5. Open items
 
-- [ ] Decide A vs. B above with the diag team's input.
+- [x] Decide A vs. B above with the diag team's input. → **A** (see above).
 - [ ] If (A): remove `repair_ssh_mesh.sh` generation/staging from
       `deploy_rack_nccl_test.sh`, drop `sshpass` from the pack manifest,
       update `run_nccl_test.sh`'s fail-fast message to reference jumper
       redeploy instead.
-- [ ] If (B): no further code change needed; document the tradeoff in
-      `GB300_mpirun_NCCL_diag_deployment.md`.
 - [ ] Diff a freshly-deployed sibling's `authorized_keys` (post-v0.17) against
       the .137 dump to confirm the dedupe fix leaves exactly one `root@root`
-      line on a clean run (mentioned as a follow-up, not yet confirmed done).
+      line on a clean run. Confirmed by inspecting a node's `authorized_keys`.
 - [ ] Point the diag team's automation at v0.17 specifically.

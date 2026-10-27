@@ -1,6 +1,13 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v12** (2026-08-03)
+**Doc version: v13** (2026-10-27)
+- v13: decided option A for `repair_ssh_mesh.sh` (retire it). It has never
+  been used in practice, because the deploy script's own `[2/4]`/`[2b/4]`
+  mesh handling works reliably and the jumper is always reachable. The
+  script change to remove it has not been made yet; until then the
+  script still stages it. Also records that the v0.17 `authorized_keys`
+  dedupe fix has been confirmed against a live node's `authorized_keys`,
+  and updates the current deploy script version to v0.21.
 - v12: updated the `NCCL_P2P_SCHEDULE_GROUP_SIZE=1` finding — NV reached
   this recommendation by reviewing this rack's own
   `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING,GRAPH,P2P` log, not a general
@@ -512,7 +519,7 @@ bash /root/portable-nccl/run/repair_ssh_mesh.sh --only 192.168.14.191 --bootstra
 
 | File | Purpose |
 |---|---|
-| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh + verify, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.17**. |
+| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh + verify, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.21**. |
 | `test_all_racks.sh` | Thin loop over every `rackXX.sh` found next to it, calling `deploy_rack_nccl_test.sh` per rack and writing a pass/fail summary under `results/`. |
 | `nccl_arm64.Dockerfile` | One-off build recipe for the pack's contents (Slurm-free Open MPI 4.1.6 + pinned NCCL v2.28.7-1 + nccl-tests v2.17.8). Built once, not part of the per-rack deploy pipeline; its `/usr/local` + `/var/nccl-tests/build` output is copied out and `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. |
 | `repair_ssh_mesh.sh` | Staged onto node-00 alongside `run_nccl_test.sh`. Standalone node-00 → sibling SSH trust (and, with `--redeploy`, pack) repair utility — the only file in this pack that ever imports `sshpass` or handles a password. See "SSH trust bootstrap" below, including the current recommendation on whether to keep this vs. relying on jumper-side redeploy. |
@@ -860,8 +867,15 @@ simply re-running `./deploy_rack_nccl_test.sh rackXX.sh --bootstrap
 tradeoff being weighed is scope/speed (`repair_ssh_mesh.sh --only <ip>`
 fixes one node without re-touching the other 17) against one fewer file,
 one fewer code path, and one fewer place a password ever needs to exist
-on node-00. Not yet decided — pending the diag team's input on whether
-that speed difference matters enough in practice to keep both paths.
+on node-00.
+
+**Decided (2026-10-27): retire it (option A).** In practice
+`repair_ssh_mesh.sh` has never been used: the deploy script's own
+`[2/4]`/`[2b/4]` mesh handling works reliably, so a jumper-side
+`--bootstrap` redeploy covers the repair case. The script change to stop
+staging it (and to point `run_nccl_test.sh`'s fail-fast message at the
+jumper redeploy) is still pending; until it lands, deploy continues to
+stage the file.
 
 ### Duplicate `authorized_keys` entries — dedupe-on-write (v0.17)
 
@@ -883,7 +897,8 @@ it everywhere `authorized_keys` is touched (bootstrap, `[2/4]`,
 Collapses any exact-duplicate line to one copy — including the
 pre-existing factory keys — without removing any identity's access.
 Validated end-to-end on a fresh rack03 deploy with zero manual password
-entry.
+entry, and later confirmed by inspecting a deployed node's
+`authorized_keys` directly.
 
 Re-run `--bootstrap` (from the jumper) if a node is **reimaged from
 scratch** (wiping `authorized_keys` entirely); `[0/4]` preflight will
