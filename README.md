@@ -4,19 +4,26 @@ Deployment scripts and diagnostics for NCCL tests on 18-node/72-GPU GB300 racks 
 ## Collecting NCCL INFO logs from all nodes
 
 Step 1 of ranking GPUs from NCCL INFO output: collect the per-rank INFO logs
-of one full-rack run back to node-00 so they can be analyzed. No ranking
-happens here.
+of one full-rack run so they can be analyzed. No ranking happens here, and
+`deploy_rack_nccl_test.sh` / normal runs are unchanged. From the jumper, in
+the folder with `rackXX.sh` (node-00 = the LAST IP in `CM_IPS`):
 
-1. Run the full rack with INFO going to per-rank files. Until a switch
-   exists, run `rm -rf /tmp/nccl_info` on every node, then edit the
-   `-x NCCL_DEBUG=WARN` line of the generated `run/run_nccl_test.sh` on
-   node-00 to:
-   `-x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV -x NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log`
-   Avoid the `COLL`/`ALL` subsystems: they log every collective call and do
-   lower the scores. Put the line back to `WARN` afterwards.
-2. Copy `collect_nccl_info.sh` into `/root/portable-nccl/run/` on node-00
-   and run `bash collect_nccl_info.sh`. It pulls `/tmp/nccl_info/*.log`
-   from all 18 nodes in parallel into
-   `run/results/nccl_info_<timestamp>/<node-ip>/`, prints files / lines /
-   WARN count per node, and packs everything into
-   `run/results/nccl_info_<timestamp>.tar.gz`.
+```bash
+bash collect_nccl_info.sh rack17.sh --clean        # empty /tmp/nccl_info on all nodes
+
+# switch node-00's run_nccl_test.sh to INFO (keeps a .warn backup)
+ssh root@<node-00> "sed -i.warn 's#-x NCCL_DEBUG=WARN#-x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV -x NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log#' /root/portable-nccl/run/run_nccl_test.sh"
+ssh root@<node-00> bash /root/portable-nccl/run/run_nccl_test.sh
+
+# put WARN back -- restores the original file byte-for-byte
+ssh root@<node-00> mv /root/portable-nccl/run/run_nccl_test.sh.warn /root/portable-nccl/run/run_nccl_test.sh
+
+bash collect_nccl_info.sh rack17.sh                # pull logs from all nodes, in parallel
+```
+
+The collector prints files / lines / WARN count per node and writes
+`results/nccl_info_<timestamp>/<node-ip>/*.log` plus one
+`results/nccl_info_<timestamp>.tar.gz` next to the script. On node-00 it
+also works without the rack file (it reads the IMEX node list). Avoid the
+`COLL`/`ALL` debug subsystems: they log every collective call and do lower
+the scores.
