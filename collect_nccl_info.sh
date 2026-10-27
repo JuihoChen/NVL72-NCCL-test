@@ -3,8 +3,9 @@
 #
 # Run ON node-00 after an INFO run (NCCL_DEBUG=INFO with
 # NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log). Pulls every node's
-# /tmp/nccl_info/*.log back IN PARALLEL into one folder on node-00, then
-# ranks all GPUs (worst first) with rank_gpus_from_info.py.
+# /tmp/nccl_info/*.log back IN PARALLEL into one folder on node-00 and
+# packs it into a single .tar.gz, ready to copy off the rack for analysis.
+# Collection only -- no analysis/ranking happens here.
 #
 # The per-rank files stay where they are on each node: /tmp is cleared at
 # reboot, and the next INFO run empties /tmp/nccl_info first, so nothing
@@ -62,6 +63,19 @@ for ip in "${NODES[@]}"; do
 done
 [[ ${#MISSING[@]} -eq 0 ]] || echo "WARNING: nothing collected from: ${MISSING[*]} (unreachable, or that node never ran with INFO)" >&2
 
+# One-line overview per node (files, lines, WARN lines), so a node that
+# logged nothing or very differently stands out before anyone opens a file.
 echo ""
-python3 "$SCRIPT_DIR/rank_gpus_from_info.py" "$OUT_DIR" --expect $(( ${#NODES[@]} * 4 )) --csv "$OUT_DIR/gpu_ranking.csv" \
-  | tee "$OUT_DIR/gpu_ranking.txt"
+printf '%-18s %6s %8s %6s\n' "node" "files" "lines" "WARN"
+for ip in "${NODES[@]}"; do
+  files=$(find "$OUT_DIR/$ip" -name '*.log' | wc -l)
+  lines=$(cat "$OUT_DIR/$ip"/*.log 2>/dev/null | wc -l)
+  warns=$(cat "$OUT_DIR/$ip"/*.log 2>/dev/null | grep -c 'NCCL WARN')
+  printf '%-18s %6s %8s %6s\n' "$ip" "$files" "$lines" "$warns"
+done
+
+TARBALL="${OUT_DIR}.tar.gz"
+tar czf "$TARBALL" -C "$(dirname "$OUT_DIR")" "$(basename "$OUT_DIR")"
+echo ""
+echo "Collected: $OUT_DIR"
+echo "Bundle:    $TARBALL ($(du -h "$TARBALL" | cut -f1))"
