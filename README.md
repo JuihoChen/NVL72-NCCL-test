@@ -18,6 +18,8 @@ Phases: `single` (one 4-GPU job per node), `pair` (2-node ring, a node is
 suspect only when both its pairs are slow), `loo` (leave-one-out N-1 node
 jobs, for slowdowns that only appear at full scale). Each job's peak
 out-of-place busbw is compared to its phase median (`--threshold`, default
-0.90). Output: a per-node PASS/SUSPECT table plus `results.csv` and per-job
+0.90). Jobs on disjoint nodes run concurrently, so the default single + pair
+check is 6 short rounds (all 18 single-node jobs at once, then the ring's
+pairs in two halves, for each collective); `--serial` turns that off. Output: a per-node PASS/SUSPECT table plus `results.csv` and per-job
 logs under `run/results/find_slow_nodes_<timestamp>/`. Exits 2 when any node
 is flagged.

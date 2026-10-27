@@ -31,8 +31,8 @@
 # NV's acceptance spec uses -- see the design doc). Any "#wrong" > 0, a
 # non-zero exit, or a timeout is a hard FAIL regardless of bandwidth.
 #
-# Jobs run strictly one at a time: concurrent jobs would share the
-# NVSwitch fabric and contaminate each other's numbers.
+# Jobs on disjoint nodes run concurrently (see run_phase), so single +
+# pair over both collectives is 6 short rounds instead of 72 serial jobs.
 #
 #   bash find_slow_nodes.sh                       # single + pair (default)
 #   bash find_slow_nodes.sh --phases single       # quickest triage
@@ -64,6 +64,7 @@ NODES_RAW=""
 MNNVL_UUID=""
 PACK_DIR=""
 PREFLIGHT=1
+SERIAL=0
 
 usage() {
   cat <<EOF
@@ -79,6 +80,7 @@ Usage: $0 [options]
   --uuid 0xNN       NCCL_MNNVL_UUID (default: read from ./run_nccl_test.sh)
   --pack-dir PATH   pack location   (default: parent of this script's folder)
   --no-preflight    skip the per-node imex/channel0/stale-process check
+  --serial          run one job at a time (default: disjoint jobs in parallel)
   --version
 EOF
 }
@@ -96,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --uuid)         MNNVL_UUID="$2"; shift 2 ;;
     --pack-dir)     PACK_DIR="$2"; shift 2 ;;
     --no-preflight) PREFLIGHT=0; shift ;;
+    --serial)       SERIAL=1; shift ;;
     --version)      echo "find_slow_nodes.sh version ${SCRIPT_VERSION}"; exit 0 ;;
     -h|--help)      usage; exit 0 ;;
     *)              echo "Unknown arg: $1" >&2; usage >&2; exit 1 ;;
@@ -272,27 +275,57 @@ jobs_for_phase() {
 # --- Run everything ---------------------------------------------------------
 declare -A PEAK STATUS   # key: "<phase>,<coll>,<job label>"
 declare -A MED           # key: "<phase>,<coll>" -> median of OK jobs
-TOTAL_JOBS=0
-for p in "${PHASE_LIST[@]}"; do TOTAL_JOBS=$(( TOTAL_JOBS + N * ${#COLL_LIST[@]} )); done
-JOB_NO=0
+# Jobs on DISJOINT node sets run concurrently in one "round": each GPU's
+# NVLinks go to the non-blocking NVSwitch trays, so disjoint jobs don't
+# share a bottleneck (a full-rack All-to-All already loads every link at
+# once). Rounds are packed greedily, so: single = 1 round, pair = 2 rounds
+# (3 for an odd node count), loo = N rounds (every job overlaps). --serial
+# runs one job at a time if concurrent results ever look inconsistent.
+run_phase() {
+  local phase="$1" coll="$2"
+  local -a pending=() round=()
+  local entry label idxs i busy used hosts log peak status r=0
+  mapfile -t pending < <(jobs_for_phase "$phase")
+  while [[ ${#pending[@]} -gt 0 ]]; do
+    r=$(( r + 1 )); round=(); used=" "; local -a rest=()
+    for entry in "${pending[@]}"; do
+      idxs="${entry#*|}"; busy=0
+      if [[ $SERIAL -eq 1 && ${#round[@]} -gt 0 ]]; then busy=1; fi
+      for i in $idxs; do [[ "$used" == *" $i "* ]] && busy=1; done
+      if [[ $busy -eq 0 ]]; then round+=("$entry"); for i in $idxs; do used+="$i "; done
+      else rest+=("$entry"); fi
+    done
+    pending=("${rest[@]}")
+    echo "  -- round ${r}: ${#round[@]} concurrent job(s) --"
+    for entry in "${round[@]}"; do
+      label="${entry%%|*}"; idxs="${entry#*|}"; hosts=()
+      for i in $idxs; do hosts+=("${NODES[$i]}"); done
+      log="$OUT_DIR/jobs/${phase}_${coll}_${label}.log"
+      ( run_job "$coll" "$log" "${hosts[@]}" > "${log%.log}.result" ) &
+    done
+    wait
+    for entry in "${round[@]}"; do
+      label="${entry%%|*}"; idxs="${entry#*|}"; hosts=()
+      for i in $idxs; do hosts+=("${NODES[$i]}"); done
+      log="$OUT_DIR/jobs/${phase}_${coll}_${label}.log"
+      read -r peak status < "${log%.log}.result"
+      PEAK["$phase,$coll,$label"]=$peak
+      STATUS["$phase,$coll,$label"]=$status
+      printf '     %-14s %-10s %3d GPUs  peak busbw %8s GB/s  %s\n' \
+        "$label" "$coll" "$(( ${#hosts[@]} * GPUS_PER_NODE ))" "$peak" "$status"
+      echo "${phase},${coll},${label},${hosts[*]},$(( ${#hosts[@]} * GPUS_PER_NODE )),${peak},${status},${log}" >> "$CSV"
+    done
+  done
+}
 
+T_START=$SECONDS
 for phase in "${PHASE_LIST[@]}"; do
   for coll in "${COLL_LIST[@]}"; do
     echo "=== Phase ${phase} / ${coll} ==="
-    while IFS='|' read -r label idxs; do
-      JOB_NO=$(( JOB_NO + 1 ))
-      hosts=()
-      for i in $idxs; do hosts+=("${NODES[$i]}"); done
-      log="$OUT_DIR/jobs/${phase}_${coll}_${label}.log"
-      read -r peak status < <(run_job "$coll" "$log" "${hosts[@]}")
-      PEAK["$phase,$coll,$label"]=$peak
-      STATUS["$phase,$coll,$label"]=$status
-      printf '  [%3d/%d] %-14s %-10s %3d GPUs  peak busbw %8s GB/s  %s\n' \
-        "$JOB_NO" "$TOTAL_JOBS" "$label" "$coll" "$(( ${#hosts[@]} * GPUS_PER_NODE ))" "$peak" "$status"
-      echo "${phase},${coll},${label},${hosts[*]},$(( ${#hosts[@]} * GPUS_PER_NODE )),${peak},${status},${log}" >> "$CSV"
-    done < <(jobs_for_phase "$phase")
+    run_phase "$phase" "$coll"
   done
 done
+echo "=== All jobs done in $(( (SECONDS - T_START) / 60 ))m$(( (SECONDS - T_START) % 60 ))s ==="
 
 # --- Scoring ----------------------------------------------------------------
 median() { printf '%s\n' "$@" | sort -g | awk '{a[NR]=$1} END{ if (NR%2) print a[(NR+1)/2]; else printf "%.2f\n", (a[NR/2]+a[NR/2+1])/2 }'; }
