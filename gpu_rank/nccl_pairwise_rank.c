@@ -352,6 +352,19 @@ int main(int argc, char **argv) {
       memcpy(hosts + (size_t)i * HOSTLEN, ids + (size_t)i * sizeof idbuf, HOSTLEN);
       memcpy(buses + (size_t)i * BUSLEN, ids + (size_t)i * sizeof idbuf + HOSTLEN, BUSLEN);
     }
+    /* Nodes may all share one hostname: if the launcher passed the hostfile order
+       (GPU_RANK_NODES=ip0,ip1,...; ranks are placed -N per node in that order),
+       label each rank "nNN/<ip>" so a GPU can be located. */
+    const char *nl = getenv("GPU_RANK_NODES");
+    const char *ls = getenv("OMPI_COMM_WORLD_LOCAL_SIZE");
+    int per = ls ? atoi(ls) : 0;
+    if (nl && *nl && per > 0) {
+      char *list = strdup(nl), *save = NULL, *ips[1024]; int nn = 0;
+      for (char *t = strtok_r(list, ",", &save); t && nn < 1024; t = strtok_r(NULL, ",", &save)) ips[nn++] = t;
+      for (int i = 0; i < N; i++)
+        if (i / per < nn) snprintf(hosts + (size_t)i * HOSTLEN, HOSTLEN, "n%02d/%s", i / per, ips[i / per]);
+      free(list);
+    }
     printf("measurement done in %.0fs\n", now_s() - t_start);
     analyze(N, B, hosts, buses, bytes, iters, csv);
     fflush(stdout);

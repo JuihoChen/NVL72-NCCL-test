@@ -146,6 +146,7 @@ echo "Using interface: $IFACE | NCCL_COMM_ID=$COMM_ID | $RUN_GPUS GPUs"
     -x NCCL_MIN_CTAS=32 \
     -x NCCL_P2P_SCHEDULE_GROUP_SIZE=1 \
     -x NCCL_COMM_ID=$COMM_ID \
+    -x GPU_RANK_NODES="$(IFS=,; echo "${NODES[*]}")" \
     "$BIN" -o "$CSV" "${EXTRA[@]}"
   echo "$(date) : Done."
 } 2>&1 | tee "$LOG"
