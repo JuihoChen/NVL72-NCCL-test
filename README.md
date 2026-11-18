@@ -33,3 +33,17 @@ with the full pair matrix in `..._gpu_rank_matrix.csv`. Options pass through
 after `--`, e.g. `run_gpu_rank.sh -- -b 2G -n 20` (bytes per transfer, timed
 iterations per round). `nccl_pairwise_rank --selftest [N] [slow_rank] [factor]`
 shows the ranking on synthetic data without any GPU.
+
+The output has three tables: the speed ranking (slowest first, with each GPU's
+worst partner), the same GPUs **by location** (rank 0..N-1 = node x GPU, with
+each GPU's speed position `#`), and the **per-node mean** score. Hosts are
+labelled `nNN/<ip>` in hostfile order, since all nodes may share one hostname.
+
+**Healthy reference** (known-good GB300 NVL72 rack, NCCL 2.28.7, 1 GiB, 3 runs;
+All-Reduce ~927 GB/s, All-to-All ~670 GB/s): rack median ~607-610 GB/s, every
+GPU within ~94-108% of the median, per-node means ~96-107%, and no GPU
+repeatedly named as worst partner. The tray order is stable across runs, so a
+tray at ~96% is normal spread. Neighbour rounds (r+-1, r+-2) are naturally
+slower (~210-500 GB/s shared) and are not a fault. On a bad (NG) rack, look for
+a GPU or node well below this band (e.g. < 90%) that healthy GPUs share as
+their worst partner.
