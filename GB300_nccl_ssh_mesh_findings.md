@@ -87,15 +87,16 @@ since they're the ones operating it.
 
 **Decision (2026-10-27): A.** `repair_ssh_mesh.sh` has never been used in
 practice because the deploy script's own mesh handling works reliably.
-The script change itself is still pending (see open items).
+Implemented in deploy script v0.23 (2026-11-18).
 
 ## 5. Open items
 
 - [x] Decide A vs. B above with the diag team's input. → **A** (see above).
-- [ ] If (A): remove `repair_ssh_mesh.sh` generation/staging from
+- [x] If (A): remove `repair_ssh_mesh.sh` generation/staging from
       `deploy_rack_nccl_test.sh`, drop `sshpass` from the pack manifest,
       update `run_nccl_test.sh`'s fail-fast message to reference jumper
-      redeploy instead.
+      redeploy instead. → done in v0.23; nothing on node-00 needs `sshpass`
+      any more (the jumper still uses it for `--bootstrap`).
 - [ ] Diff a freshly-deployed sibling's `authorized_keys` (post-v0.17) against
       the .137 dump to confirm the dedupe fix leaves exactly one `root@root`
       line on a clean run. Confirmed by inspecting a node's `authorized_keys`.
