@@ -57,6 +57,8 @@
 #   bash run/run_nccl_test.sh 9      # half rack (9 nodes / 36 GPUs -- matches
 #                                     # NVIDIA's published GB300 NVL72 spec table)
 #   bash run/run_nccl_test.sh 1      # single-node smoke test (4 GPUs)
+#   bash run/run_nccl_test.sh --info # diagnostic: NCCL INFO -> /tmp/nccl_info/
+#                                     # per rank (v0.22; see note below)
 #
 # NCCL_MNNVL_UUID is auto-derived from the rack filename if not given
 # (rack17.sh -> 0x17, rack8.sh -> 0x08) -- a human-traceable tag, not a
@@ -93,10 +95,23 @@
 # touches these; OpenMPI here is just the launcher/bootstrapper. This one
 # flag covers any missing optional component, present or future, instead
 # of hardcoding today's specific list of four.
+#
+# v0.22: run_nccl_test.sh takes an opt-in --info switch (any position,
+# alongside the optional node count). Without it, nothing changes: same
+# mpirun argv (NCCL_DEBUG=WARN), same output, same log name. With it:
+#   - /tmp/nccl_info is emptied and recreated on every node in pre-flight
+#   - NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV and
+#     NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log replace NCCL_DEBUG=WARN
+#     (one file per rank -- ranks sharing one path would truncate each
+#     other; /tmp clears itself at reboot). COLL/ALL subsystems are left
+#     out on purpose: they log every collective call and lower busbw.
+#   - the log name gets an _info suffix so INFO runs are never mistaken
+#     for scoring runs
+# Pull the per-rank files back with collect_nccl_info.sh (jumper or node-00).
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.21"
+SCRIPT_VERSION="0.22"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -577,13 +592,25 @@ NODE_LIST_CONTENT="\$(printf '%s\\n' "\${NODES[@]}")"
 #   bash run_nccl_test.sh        # full rack (default, \${#NODES[@]} nodes)
 #   bash run_nccl_test.sh 9      # 9 nodes (36 GPUs, half rack)
 #   bash run_nccl_test.sh 1      # 1 node (4 GPUs, smoke test)
+#   bash run_nccl_test.sh --info # full rack, NCCL INFO -> /tmp/nccl_info/
+#
+# --info is pulled out first so the node-count handling below sees exactly
+# the same arguments as before when it isn't given.
+INFO=0
+ARGS=()
+for a in "\$@"; do
+  if [[ "\$a" == "--info" ]]; then INFO=1; else ARGS+=("\$a"); fi
+done
+set -- "\${ARGS[@]}"
 NODES_REQUESTED="\${1:-\${#NODES[@]}}"
 case "\$NODES_REQUESTED" in
   -h|--help)
-    echo "Usage: \$0 [node_count]"
+    echo "Usage: \$0 [node_count] [--info]"
     echo "  node_count: number of WHOLE nodes to test with (each contributes"
     echo "  all ${GPUS_PER_NODE} of its GPUs). Default: \${#NODES[@]} (full rack)."
     echo "  Must be between 1 and \${#NODES[@]} for this rack."
+    echo "  --info: NCCL_DEBUG=INFO into /tmp/nccl_info/%h.%p.log on every node"
+    echo "  (diagnostic runs only; collect with collect_nccl_info.sh)."
     exit 0
     ;;
 esac
@@ -622,6 +649,9 @@ echo "    node-00 -> all \${#NODES[@]} siblings: OK"
 echo "=== Pre-flight: checking nvidia-imex + channel0 + pack on \${#NODES[@]} node(s) ==="
 for ip in "\${NODES[@]}"; do
   ssh \$SSH_OPTS "root@\${ip}" "mkdir -p \$(dirname "${IMEX_CFG}") && cat > ${IMEX_CFG}" <<< "\$NODE_LIST_CONTENT"
+  if [[ \$INFO -eq 1 ]]; then
+    ssh \$SSH_OPTS "root@\${ip}" "rm -rf /tmp/nccl_info && mkdir -p /tmp/nccl_info"
+  fi
   ssh \$SSH_OPTS "root@\${ip}" PACK_DIR="\$PACK_DIR" PACK_CACHE="\$PACK_CACHE" bash -s <<'REMOTE'
 set -e
 if ! systemctl is-active --quiet nvidia-imex; then
@@ -739,6 +769,14 @@ echo "Using interface: \$IFACE"
 mkdir -p ${RUN_DIR}/results 2>/dev/null || true
 LOG="${RUN_DIR}/results/\$(date +%Y%m%d_%H%M%S)_\${NODES_REQUESTED}node.log"
 
+# NCCL debug args: WARN unless --info (see v0.22 note in the deploy script).
+DEBUG_ARGS=(-x NCCL_DEBUG=WARN)
+if [[ \$INFO -eq 1 ]]; then
+  DEBUG_ARGS=(-x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV -x NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log)
+  LOG="\${LOG%.log}_info.log"
+  echo "NCCL INFO mode: per-rank logs -> /tmp/nccl_info/ on every node (not a scoring run)"
+fi
+
 run_one() {
   local bin_path="\$1" args="\$2" label="\$3"
   echo "--- \$label ---"
@@ -758,7 +796,7 @@ run_one() {
     -x OPAL_PREFIX="\$PACK_DIR" \\
     -x PATH="\$PACK_DIR/bin:\$PATH" \\
     -x LD_LIBRARY_PATH="\$PACK_DIR/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}" \\
-    -x NCCL_DEBUG=WARN \\
+    "\${DEBUG_ARGS[@]}" \\
     -x NCCL_SOCKET_IFNAME=\$IFACE \\
     -x NCCL_MNNVL_ENABLE=2 \\
     -x NCCL_NVLS_ENABLE=1 \\
@@ -780,6 +818,9 @@ run_one() {
 } 2>&1 | tee "\$LOG"
 echo ""
 echo "Log saved on this node: \$LOG"
+if [[ \$INFO -eq 1 ]]; then
+  echo "NCCL INFO files: /tmp/nccl_info/*.log on each node -- pull them with collect_nccl_info.sh"
+fi
 INNER
 }
 
@@ -818,6 +859,7 @@ Next: ssh root@${NODE00} then 'bash ${RUN_DIR}/run_nccl_test.sh'
       Optional node-count arg (whole nodes, default = full rack):
         bash ${RUN_DIR}/run_nccl_test.sh             # full rack (${#NODES[@]} nodes / ${TOTAL_RANKS} GPUs)
         bash ${RUN_DIR}/run_nccl_test.sh ${HALF_NODES}              # half rack (${HALF_NODES} nodes / $((HALF_NODES * GPUS_PER_NODE)) GPUs)
+        bash ${RUN_DIR}/run_nccl_test.sh --info      # diagnostic: NCCL INFO -> /tmp/nccl_info/ per rank
 
       Also staged: ${RUN_DIR}/repair_ssh_mesh.sh -- run this ON node-00 (not
       from the jumper) if run_nccl_test.sh reports a broken node-00 -> sibling
