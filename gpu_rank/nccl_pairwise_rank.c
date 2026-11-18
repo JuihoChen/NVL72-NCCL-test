@@ -217,6 +217,18 @@ static void analyze(int N, const double *B, const char *hosts, const char *buses
            hosts + (size_t)g * HOSTLEN, buses + (size_t)g * BUSLEN, score[g], 100.0 * score[g] / med, own[g],
            worstp[g], hosts + (size_t)worstp[g] * HOSTLEN, buses + (size_t)worstp[g] * BUSLEN, worstv[g]);
   }
+  /* Same GPUs in location order (rank = node x GPU), with each GPU's speed position. */
+  {
+    int *pos = malloc(N * sizeof *pos);
+    for (int p = 0; p < N; p++) pos[order[p]] = p + 1;
+    printf("\n=== By location: rank order (node, GPU) with speed position # (1 = slowest) ===\n");
+    printf("%5s  %-20s %-14s %9s %6s %4s\n", "rank", "host", "busId", "score", "vsMed", "#");
+    for (int g = 0; g < N; g++)
+      printf("%5d  %-20s %-14s %9.1f %5.1f%% %4d\n", g, hosts + (size_t)g * HOSTLEN, buses + (size_t)g * BUSLEN,
+             score[g], 100.0 * score[g] / med, pos[g]);
+    free(pos);
+  }
+
   /* Per-node (tray) summary: GPUs grouped by host label, slowest node first. */
   {
     int *grp = malloc(N * sizeof *grp), ng = 0, *first = malloc(N * sizeof *first);
