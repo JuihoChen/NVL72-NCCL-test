@@ -1,6 +1,10 @@
 # GB300 NVL72 — Slurm-free Multi-Node NCCL Diag Deployment
 
-**Doc version: v13** (2026-10-27)
+**Doc version: v14** (2026-11-18)
+- v14: deploy script v0.23 removes `repair_ssh_mesh.sh` (option A from
+  v13). `[3/4]` now stages only `run_nccl_test.sh`, and its fail-fast mesh
+  check points at a jumper-side `--bootstrap` redeploy instead. Current
+  deploy script version is now v0.23.
 - v13: decided option A for `repair_ssh_mesh.sh` (retire it). It has never
   been used in practice, because the deploy script's own `[2/4]`/`[2b/4]`
   mesh handling works reliably and the jumper is always reachable. The
@@ -112,11 +116,11 @@ either.
   the script reverses it so index 0 ("IP0") is **node-00**, the lowest IP,
   used as the mpirun launch node.
 - **node-00**: the launch/anchor node. After deploy, it holds
-  `run_nccl_test.sh` (and `repair_ssh_mesh.sh`, see "SSH trust bootstrap"
-  below) and has passwordless root SSH to every sibling — though this mesh
-  is not guaranteed to survive a reboot/reimage on this hardware; both
-  scripts check for that and self-heal or point at the fix rather than
-  assuming it's still intact.
+  `run_nccl_test.sh` and has passwordless root SSH to every sibling —
+  though this mesh is not guaranteed to survive a reboot/reimage on this
+  hardware; `run_nccl_test.sh` checks for that and points at the fix
+  (a jumper-side `--bootstrap` redeploy, see "SSH trust bootstrap" below)
+  rather than assuming it's still intact.
 
 ## Why not a container at test time
 
@@ -333,8 +337,7 @@ One script, one rack file as its argument:
    is the mesh mpirun actually uses (node→node, not jumper→node) — see
    "SSH trust bootstrap" below for the full design, including why this
    mesh needs re-verifying at test time too, not just at deploy time.
-3. **Staging** — generates and pushes `run_nccl_test.sh` **and**
-   `repair_ssh_mesh.sh` onto node-00, under
+3. **Staging** — generates and pushes `run_nccl_test.sh` onto node-00, under
    `/root/portable-nccl/run/`. By the time deploy finishes, node-00 is
    fully ready — no second script needed for a normal run.
 4. **(optional `--auto`)** — SSHes into node-00 and runs it immediately.
@@ -362,7 +365,8 @@ runs, not just once at deploy time:
    deploy time, run again because **this mesh does not reliably survive a
    reboot/reimage on this hardware** (see "SSH trust bootstrap" below for
    the confirming evidence). On failure, exits immediately with a pointer
-   to `repair_ssh_mesh.sh` rather than proceeding into a silent `mpirun`
+   to `./deploy_rack_nccl_test.sh rackXX.sh --bootstrap <password>` (run
+   from the jumper) rather than proceeding into a silent `mpirun`
    hang with no way to prompt for a password (`BatchMode`, no TTY).
 2. **`nvidia-imex` / `channel0`** — `channel0` is a kernel-driver-backed
    `/dev` node created with a manual `mknod`, not a persistent udev rule.
@@ -474,9 +478,9 @@ everything.
   the pack persists on local disk and isn't affected by reboots at all.
 - **The SSH mesh is a different story** — it does not reliably survive
   every reboot/reimage on this hardware. `run_nccl_test.sh` checks for
-  this itself (first pre-flight step, above) and points at
-  `repair_ssh_mesh.sh` rather than silently hanging; see "SSH trust
-  bootstrap" below for the full design and current recommendation.
+  this itself (first pre-flight step, above) and points at a jumper-side
+  `--bootstrap` redeploy rather than silently hanging; see "SSH trust
+  bootstrap" below for the full design.
 
 ## Usage
 
@@ -504,11 +508,9 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.191
 
 # If run_nccl_test.sh reports a broken node-00 -> sibling mesh (e.g. after
-# a reboot in transit), run this ON node-00 -- not from the jumper:
-bash /root/portable-nccl/run/repair_ssh_mesh.sh --bootstrap <password>
-# scoped to one node, and also re-push the pack (a field same-IP swap
-# with no jumper reachability needed):
-bash /root/portable-nccl/run/repair_ssh_mesh.sh --only 192.168.14.191 --bootstrap <password> --redeploy
+# a reboot in transit), re-run the deploy from the jumper with --bootstrap
+# (the pack copy is skipped on nodes that already have it):
+./deploy_rack_nccl_test.sh rack17.sh --bootstrap <password>
 
 # Whole fleet, one rack at a time
 ./test_all_racks.sh                 # all rack*.sh next to the scripts
@@ -519,10 +521,9 @@ bash /root/portable-nccl/run/repair_ssh_mesh.sh --only 192.168.14.191 --bootstra
 
 | File | Purpose |
 |---|---|
-| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh + verify, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.21**. |
+| `deploy_rack_nccl_test.sh` | The whole pipeline for one rack: parallel pack distribution, SSH mesh + verify, staging, optional auto-run. Takes `rackXX.sh` as its primary argument. Current version: **v0.23**. |
 | `test_all_racks.sh` | Thin loop over every `rackXX.sh` found next to it, calling `deploy_rack_nccl_test.sh` per rack and writing a pass/fail summary under `results/`. |
 | `nccl_arm64.Dockerfile` | One-off build recipe for the pack's contents (Slurm-free Open MPI 4.1.6 + pinned NCCL v2.28.7-1 + nccl-tests v2.17.8). Built once, not part of the per-rack deploy pipeline; its `/usr/local` + `/var/nccl-tests/build` output is copied out and `tar czf`'d into `nccl-test-pack-arm64.tar.gz`. |
-| `repair_ssh_mesh.sh` | Staged onto node-00 alongside `run_nccl_test.sh`. Standalone node-00 → sibling SSH trust (and, with `--redeploy`, pack) repair utility — the only file in this pack that ever imports `sshpass` or handles a password. See "SSH trust bootstrap" below, including the current recommendation on whether to keep this vs. relying on jumper-side redeploy. |
 
 Both expect to live in the same directory as the rack inventory files and
 the pack `.tar.gz` (e.g. `~/carlonext` on the jumper).
@@ -787,7 +788,7 @@ Fresh rack (no SSH trust)
   -> [1/4] pack distribution
   -> [2/4] generates/pushes NODE-00's OWN key to all 18 nodes
   -> [2b/4] node-00 itself verifies it can reach all 18 siblings
-  -> [3/4] stages run_nccl_test.sh + repair_ssh_mesh.sh on node-00
+  -> [3/4] stages run_nccl_test.sh on node-00
 ```
 
 ### `[2b/4]` node-00 → sibling mesh verification (v0.16)
@@ -798,7 +799,7 @@ between them is exactly what let a broken mesh go undetected until
 `mpirun` hung, in practice. `[2b/4]` closes that gap: right after `[2/4]`,
 the jumper has **node-00 itself** attempt a `BatchMode=yes` SSH to every
 sibling, and fails the whole deploy loudly if any don't respond —
-*before* `run_nccl_test.sh`/`repair_ssh_mesh.sh` are even staged.
+*before* `run_nccl_test.sh` is even staged.
 
 ### The mesh doesn't reliably survive reboot/reimage — confirmed live
 
@@ -829,53 +830,22 @@ provisioning/reimaging), not something deploy-time code can prevent.
 
 **Because of this, `run_nccl_test.sh` now runs its own copy of the
 `[2b/4]` check first, every invocation**, and fails fast with a pointer
-to `repair_ssh_mesh.sh` instead of the 36-password/silent-hang sequence
+to a jumper-side `--bootstrap` redeploy instead of the 36-password/silent-hang sequence
 above (see "Pre-flight" above).
 
-### `repair_ssh_mesh.sh` — standalone node-00 trust/pack repair
+### `repair_ssh_mesh.sh` — retired in v0.23
 
-Staged onto node-00 alongside `run_nccl_test.sh`. Kept as a **separate
-file** rather than a flag on `run_nccl_test.sh` deliberately: it's the
-only file in this pack that ever imports `sshpass` or sees a password, so
-"does this script ever handle a credential" stays answerable by filename
-alone. Reuses node-00's **existing** keypair (from `[2/4]`) — never
-generates a new one.
-
-```bash
-# check only, no-op if the mesh is already healthy:
-bash repair_ssh_mesh.sh
-# repair whichever sibling(s) fail the check:
-bash repair_ssh_mesh.sh --bootstrap <password>
-# scope to a specific node (e.g. a field same-IP swap):
-bash repair_ssh_mesh.sh --only <ip> --bootstrap <password>
-# also re-push the pack from node-00's local cache -- no jumper
-# reachability needed at all:
-bash repair_ssh_mesh.sh --only <ip> --bootstrap <password> --redeploy
-```
-
-An unrecognized IP passed to `--only` is rejected rather than guessed at
-— a genuinely new IP (not a same-IP swap) needs `CM_IPS` updated in
-`rackXX.sh` and a fresh deploy from the jumper.
-
-**Current recommendation for this fleet:** this deployment's jumper is
-confirmed always network-reachable to every rack, for the rack's whole
-life — no disconnected field/customer sites where the jumper can't reach
-it. Given that, `repair_ssh_mesh.sh` is **functionally redundant** with
-simply re-running `./deploy_rack_nccl_test.sh rackXX.sh --bootstrap
-<password>` from the jumper, which fixes the same underlying problem via
-`[2/4]`/`[2b/4]` and needs no `sshpass` bundled into the pack at all. The
-tradeoff being weighed is scope/speed (`repair_ssh_mesh.sh --only <ip>`
-fixes one node without re-touching the other 17) against one fewer file,
-one fewer code path, and one fewer place a password ever needs to exist
-on node-00.
-
-**Decided (2026-10-27): retire it (option A).** In practice
-`repair_ssh_mesh.sh` has never been used: the deploy script's own
-`[2/4]`/`[2b/4]` mesh handling works reliably, so a jumper-side
-`--bootstrap` redeploy covers the repair case. The script change to stop
-staging it (and to point `run_nccl_test.sh`'s fail-fast message at the
-jumper redeploy) is still pending; until it lands, deploy continues to
-stage the file.
+Earlier versions also staged a standalone `repair_ssh_mesh.sh` on node-00
+(an `sshpass`-based node-00 → sibling trust repair, with `--only` and
+`--redeploy`). This deployment's jumper is always network-reachable to
+every rack, so re-running `./deploy_rack_nccl_test.sh rackXX.sh
+--bootstrap <password>` from the jumper fixes the same problem via
+`[2/4]`/`[2b/4]`, and node-00 never needs `sshpass` or a password. The
+repair script was never used in practice, so option A was decided on
+2026-10-27 and v0.23 removed it: deploy no longer generates or stages it,
+and `run_nccl_test.sh`'s fail-fast message points at the jumper redeploy.
+A copy left on node-00 by an older deploy is not removed and is no longer
+referenced.
 
 ### Duplicate `authorized_keys` entries — dedupe-on-write (v0.17)
 
