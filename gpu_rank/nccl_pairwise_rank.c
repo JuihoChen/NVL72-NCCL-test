@@ -217,6 +217,34 @@ static void analyze(int N, const double *B, const char *hosts, const char *buses
            hosts + (size_t)g * HOSTLEN, buses + (size_t)g * BUSLEN, score[g], 100.0 * score[g] / med, own[g],
            worstp[g], hosts + (size_t)worstp[g] * HOSTLEN, buses + (size_t)worstp[g] * BUSLEN, worstv[g]);
   }
+  /* Per-node (tray) summary: GPUs grouped by host label, slowest node first. */
+  {
+    int *grp = malloc(N * sizeof *grp), ng = 0, *first = malloc(N * sizeof *first);
+    for (int g = 0; g < N; g++) {
+      int k;
+      for (k = 0; k < ng; k++)
+        if (!strcmp(hosts + (size_t)first[k] * HOSTLEN, hosts + (size_t)g * HOSTLEN)) break;
+      if (k == ng) first[ng++] = g;
+      grp[g] = k;
+    }
+    if (ng > 1) {
+      double *gs = calloc(ng, sizeof *gs); int *gn = calloc(ng, sizeof *gn), *go = malloc(ng * sizeof *go);
+      for (int g = 0; g < N; g++) { gs[grp[g]] += score[g]; gn[grp[g]]++; }
+      for (int k = 0; k < ng; k++) { gs[k] /= gn[k]; go[k] = k; }
+      g_score = gs;
+      qsort(go, ng, sizeof *go, cmp_by_score);
+      printf("\n=== Per-node mean score: slowest -> fastest ===\n");
+      for (int p = 0; p < ng; p++) {
+        int k = go[p];
+        printf("%4d  %-20s %9.1f %5.1f%%  ranks", p + 1, hosts + (size_t)first[k] * HOSTLEN, gs[k], 100.0 * gs[k] / med);
+        for (int g = 0; g < N; g++) if (grp[g] == k) printf(" %d", g);
+        printf("\n");
+      }
+      g_score = score;
+      free(gs); free(gn); free(go);
+    }
+    free(grp); free(first);
+  }
   printf("\nRead it top-down: a GPU clearly below the rack median (e.g. < 95%%) whose 'own' column is\n"
          "also low is the suspect; healthy GPUs list that same suspect as their worst partner.\n");
 
