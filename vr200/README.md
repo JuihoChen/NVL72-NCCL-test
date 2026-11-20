@@ -76,10 +76,14 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    nv show sdn state app nmx-controller type topology files
    ```
 
+   The `generate` action produced **one new topology state file** (it appears in
+   the `show ... files` list), so it is not purely a no-op on the switch: the
+   controller exported its current topology view to disk at that moment.
+
    Minutes later both trays showed `Health: Healthy`, `Route Unhealthy: False`,
    P2P `OK` on every GPU pair and the same `CliqueId`, and the default partition
-   32766 went from `unhealthy` to `healthy`. Generating a state file is expected
-   to be read-only, so this may be coincidence (the GFM recovering on its own, or
+   32766 went from `unhealthy` to `healthy`. Generating a state file is not expected
+   to change routing, so this may be coincidence (the GFM recovering on its own, or
    someone else acting on the switch at the same time), but nothing else was
    changed on our side. If `Route Unhealthy: True` comes back, run these two
    commands first, note the time, and check `nv show sdn partition` and
