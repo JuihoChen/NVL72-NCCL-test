@@ -82,7 +82,15 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    the partition had become healthy fixed it** (both re-registered with the same
    mode). Check with `sudo dmesg -T | grep -i bwMode` after a cross-tray failure.
 
-Same-tray baseline (4 GPUs, 32 GB): All-Reduce ~1080 GB/s, All-to-All ~1100 GB/s busbw.
+## Baselines (driver 620.62, NCCL 2.32.4gr100, Nov 20 2026)
+
+| Run | All-Reduce busbw @ 32 GB | All-to-All busbw @ 32 GB |
+|---|---|---|
+| 1 tray, 4 GPUs | ~1080 GB/s | ~1100 GB/s |
+| 2 trays, 8 GPUs, MNNVL + NVLS | **~1485 GB/s** | **~1099 GB/s** |
+
+Two-tray `--info` run: `via P2P/MNNVL` between trays, "NVLS multicast support is
+available", no `bwMode`/multicast errors in `dmesg`. `#wrong` 0 everywhere.
 
 ## GFM switch commands used
 
