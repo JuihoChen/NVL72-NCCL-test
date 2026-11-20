@@ -15,7 +15,8 @@ healthy GPU meets it in only a few, so it stands out clearly; healthy GPUs
 also name it as their "worst partner".
 
 It is separate from the normal test: `run_nccl_test.sh` and
-`deploy_rack_nccl_test.sh` are unchanged. `run_gpu_rank.sh` reuses the same
+`deploy_rack_nccl_test.sh` are unchanged, and an already-staged
+`run_nccl_test.sh` works as is. `run_gpu_rank.sh` reuses the same
 mpirun flags and NCCL env (plus `NCCL_COMM_ID` for the NCCL bootstrap), builds
 the binary on node-00 with plain `gcc` on first use (no CUDA/NCCL/MPI headers:
 it `dlopen()`s the pack's libnccl/libcudart), and copies it to every node.
@@ -24,9 +25,15 @@ From the jumper (node-00 = the LAST IP in `CM_IPS`):
 
 ```bash
 scp gpu_rank/nccl_pairwise_rank.c gpu_rank/run_gpu_rank.sh root@<node-00>:/root/portable-nccl/run/
-ssh root@<node-00> bash /root/portable-nccl/run/run_nccl_test.sh 1   # only if rebooted since the last test
 ssh root@<node-00> bash /root/portable-nccl/run/run_gpu_rank.sh
 ```
+
+`run_gpu_rank.sh` no longer needs a `run_nccl_test.sh` run first. It runs
+only the pre-flight part of the staged `run_nccl_test.sh` (SSH mesh check,
+IMEX node list, nvidia-imex/channel0 repair, stale-process cleanup, pack
+check), cut out of that file up to its `=== Pre-flight complete ===` line,
+and skips the All-Reduce / All-to-All sweep. Pass `--no-preflight` to skip
+it when the rack state is known good.
 
 Output goes to the screen and to `run/results/<timestamp>_<N>node_gpu_rank.log`,
 with the full pair matrix in `..._gpu_rank_matrix.csv`. Options pass through
