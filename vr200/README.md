@@ -66,6 +66,27 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    default partition 32766 (`location_based`, 72 GPUs) was `unhealthy`: the rack
    is missing trays (slots 26, 27 and two GPUs of slot 18 show UUID 0). Routes
    later recovered without a partition change; cause not confirmed.
+
+   **Observation worth repeating:** the recovery was first seen right after these
+   two commands were run on the GFM switch (Nov 20 2026, ~03:1x UTC), while backing
+   up the controller state:
+
+   ```bash
+   nv action generate sdn state app nmx-controller type topology
+   nv show sdn state app nmx-controller type topology files
+   ```
+
+   Minutes later both trays showed `Health: Healthy`, `Route Unhealthy: False`,
+   P2P `OK` on every GPU pair and the same `CliqueId`, and the default partition
+   32766 went from `unhealthy` to `healthy`. Generating a state file is expected
+   to be read-only, so this may be coincidence (the GFM recovering on its own, or
+   someone else acting on the switch at the same time), but nothing else was
+   changed on our side. If `Route Unhealthy: True` comes back, run these two
+   commands first, note the time, and check `nv show sdn partition` and
+   `nvidia-smi -q | grep -E "Summary|Route Unhealthy"` a few minutes later, so the
+   next occurrence can confirm or rule out the link. `nv action update sdn
+   partition 32766 reroute` is not an option: it returns `NMX_ST_NOT_SUPPORTED`
+   on the default partition.
 3. **Identical hostnames hang Open MPI 5** before NCCL starts (cloned OS image ->
    every tray is `localhost`). Open MPI 4 / HPC-X (rack pack, NGC containers)
    does not have this problem. Fix here: unique hostnames.
