@@ -42,7 +42,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.6-vr"
+SCRIPT_VERSION="0.7-vr"
 GPUS_PER_NODE=4
 DEFAULT_HOSTS="192.168.101.136,192.168.101.137"
 if [[ -z "${NCCL_TESTS_DIR:-}" ]]; then
@@ -405,7 +405,8 @@ fi
 # --- 4. Summary ------------------------------------------------------------
 echo ""
 echo "=== Summary ==="
-grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure|NCCL WARN .*(failure|error)" "$LOG" | sort -u -k1,1 -s | head -20 || true
+# exact-line de-dup only (sort -u -k1,1 collapsed every "# ..." line into one)
+grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" | awk '!seen[$0]++' | head -20 || true
 RC=0
 grep -aq "!!! " "$LOG" && RC=1
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1

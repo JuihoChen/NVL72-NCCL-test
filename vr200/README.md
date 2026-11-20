@@ -69,11 +69,20 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
 3. **Identical hostnames hang Open MPI 5** before NCCL starts (cloned OS image ->
    every tray is `localhost`). Open MPI 4 / HPC-X (rack pack, NGC containers)
    does not have this problem. Fix here: unique hostnames.
-4. **Open:** across trays, NCCL fails at the first transfer importing the peer
-   tray's memory: `ncclP2pImportShareableBuffer` CUDA 401/400 (`--no-nvls`), and
-   with NVLS `ncclMcGroupBuildPartitions` CUDA 999. Same tray works (All-Reduce
-   ~1080 GB/s, All-to-All ~1100 GB/s busbw at 32 GB). Suspects: the still
-   unhealthy partition 32766, and IMEX 2.0.0.rel47 (trays) vs GFM 2.0.0.rel51.
+4. **Cross-tray memory import refused: NVLink `bwMode` mismatch.** Across trays
+   NCCL failed at the first transfer: `ncclP2pImportShareableBuffer` CUDA 401/400
+   (`--no-nvls`), and with NVLS `ncclMcGroupBuildPartitions` CUDA 999. IMEX logged
+   `OBJECT_NOT_FOUND` / `NV_ERR_CYCLE_DETECTED`; the real cause was in `dmesg`:
+   `memoryfabricimportv2IsGpuMapAllowed_IMPL: bwMode does not match: owner 0,
+   mapper 293` - the two trays' GPUs carried different fabric bandwidth modes
+   (slot 2 = 293, slot 1 = 0) although driver, firmware, module options and
+   `nvidia-smi -q` fabric sections were identical, and `nvidia-smi nvlink -gBwMode`
+   is "not supported". `nv action update sdn partition 32766 reroute` returns
+   `NMX_ST_NOT_SUPPORTED` on the default partition. **Rebooting both trays after
+   the partition had become healthy fixed it** (both re-registered with the same
+   mode). Check with `sudo dmesg -T | grep -i bwMode` after a cross-tray failure.
+
+Same-tray baseline (4 GPUs, 32 GB): All-Reduce ~1080 GB/s, All-to-All ~1100 GB/s busbw.
 
 ## GFM switch commands used
 
