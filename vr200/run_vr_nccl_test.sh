@@ -31,6 +31,8 @@
 #   bash run_vr_nccl_test.sh --no-mnnvl      # NCCL_MNNVL_ENABLE=0 (+ no NVLS): control run that
 #                                            # avoids NVLink between nodes (TCP, slow) to prove
 #                                            # MPI/NCCL/tests are fine apart from the fabric
+#                                            # (default max size then 64M: TCP over the
+#                                            # bootstrap NIC is ~0.1 GB/s)
 #
 # Overridable via environment:
 #   NCCL_TESTS_DIR (default ~/nccl-tests, then /home/nvidia/nccl-tests)
@@ -40,7 +42,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.5-vr"
+SCRIPT_VERSION="0.6-vr"
 GPUS_PER_NODE=4
 DEFAULT_HOSTS="192.168.101.136,192.168.101.137"
 if [[ -z "${NCCL_TESTS_DIR:-}" ]]; then
@@ -59,14 +61,14 @@ SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout
 HOSTS_RAW="$DEFAULT_HOSTS"
 INFO=0
 DRY_RUN=0
-MAX_SIZE="32G"
+MAX_SIZE=""
 MNNVL_ENABLE=2      # 2 = auto (rack script default), 1 = required, 0 = off
 IB_DISABLE=1
 NVLS_ENABLE=1
 MNNVL_UUID=""
 NODES_REQUESTED=""
 
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,6 +87,10 @@ while [[ $# -gt 0 ]]; do
     *)               echo "ERROR: unknown argument: $1 (see --help)" >&2; exit 1 ;;
   esac
 done
+
+# Default sweep: 32G, but only 64M for --no-mnnvl (TCP over a ~1 Gb/s NIC
+# would take tens of minutes per size above that)
+MAX_SIZE="${MAX_SIZE:-$([[ $MNNVL_ENABLE -eq 0 ]] && echo 64M || echo 32G)}"
 
 IFS=',' read -ra NODES <<< "$HOSTS_RAW"
 NODES_REQUESTED="${NODES_REQUESTED:-${#NODES[@]}}"
