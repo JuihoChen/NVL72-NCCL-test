@@ -405,8 +405,9 @@ fi
 # --- 4. Summary ------------------------------------------------------------
 echo ""
 echo "=== Summary ==="
-# exact-line de-dup only (sort -u -k1,1 collapsed every "# ..." line into one)
-grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" | awk '!seen[$0]++' | head -20 || true
+# per-test lines always; repeated CUDA failure lines (one per rank) only once
+grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" \
+  | awk '/Cuda failure/ { k=$0; sub(/^.*\(/, "", k); if (seen[k]++) next } { print }' | head -20 || true
 RC=0
 grep -aq "!!! " "$LOG" && RC=1
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1
