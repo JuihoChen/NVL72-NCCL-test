@@ -68,8 +68,8 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    later recovered without a partition change; cause not confirmed.
 
    **Observation worth repeating:** the recovery was first seen right after these
-   two commands were run on the GFM switch (Nov 20 2026, ~03:1x UTC), while backing
-   up the controller state:
+   two commands were run on the GFM switch (Nov 20 2026, 03:12:41 UTC), while
+   backing up the controller state:
 
    ```bash
    nv action generate sdn state app nmx-controller type topology
@@ -78,9 +78,16 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
 
    The `generate` action produced **one new topology state file** (it appears in
    the `show ... files` list), so it is not purely a no-op on the switch: the
-   controller exported its current topology view to disk at that moment.
+   controller exported its current topology view to disk at that moment:
 
-   Minutes later both trays showed `Health: Healthy`, `Route Unhealthy: False`,
+   ```
+   /host/cluster_infra/app_state/nmx-controller/topology/nmx-controller_topology_20261120_031241
+   ```
+
+   Keep this file: if routes go unhealthy again, generate a new one and give both
+   to NVIDIA for comparison.
+
+   About seven minutes later (first check at 03:19:29 UTC) both trays showed `Health: Healthy`, `Route Unhealthy: False`,
    P2P `OK` on every GPU pair and the same `CliqueId`, and the default partition
    32766 went from `unhealthy` to `healthy`. Generating a state file is not expected
    to change routing, so this may be coincidence (the GFM recovering on its own, or
