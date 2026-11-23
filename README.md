@@ -25,15 +25,16 @@ From the jumper (node-00 = the LAST IP in `CM_IPS`):
 
 ```bash
 scp gpu_rank/nccl_pairwise_rank.c gpu_rank/run_gpu_rank.sh root@<node-00>:/root/portable-nccl/run/
-ssh root@<node-00> bash /root/portable-nccl/run/run_gpu_rank.sh
+ssh root@<node-00> bash /root/portable-nccl/run/run_gpu_rank.sh --preflight   # after a reboot
+ssh root@<node-00> bash /root/portable-nccl/run/run_gpu_rank.sh               # otherwise
 ```
 
-`run_gpu_rank.sh` no longer needs a `run_nccl_test.sh` run first. It runs
-only the pre-flight part of the staged `run_nccl_test.sh` (SSH mesh check,
-IMEX node list, nvidia-imex/channel0 repair, stale-process cleanup, pack
-check), cut out of that file up to its `=== Pre-flight complete ===` line,
-and skips the All-Reduce / All-to-All sweep. Pass `--no-preflight` to skip
-it when the rack state is known good.
+After a reboot, add `--preflight` instead of running `run_nccl_test.sh`
+first. It runs only the pre-flight part of the staged `run_nccl_test.sh`
+(SSH mesh check, IMEX node list, nvidia-imex/channel0 repair, stale-process
+cleanup, pack check), cut out of that file up to its
+`=== Pre-flight complete ===` line, and skips the All-Reduce / All-to-All
+sweep. Without `--preflight` the script only checks node state, as before.
 
 Output goes to the screen and to `run/results/<timestamp>_<N>node_gpu_rank.log`,
 with the full pair matrix in `..._gpu_rank_matrix.csv`. Options pass through
