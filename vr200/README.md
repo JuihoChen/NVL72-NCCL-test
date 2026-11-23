@@ -84,7 +84,8 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    /host/cluster_infra/app_state/nmx-controller/topology/nmx-controller_topology_20261120_031241
    ```
 
-   Keep this file: if routes go unhealthy again, generate a new one and give both
+   Size 5,520,246 bytes (~5.5 MB): a full dump of the controller's view of the
+   fabric (trays, GPUs, switch ports, links), not a small summary. Keep this file: if routes go unhealthy again, generate a new one and give both
    to NVIDIA for comparison.
 
    About seven minutes later (first check at 03:19:29 UTC) both trays showed `Health: Healthy`, `Route Unhealthy: False`,
