@@ -2,7 +2,8 @@
 # assemble_pack.sh <pack dir> <nccl-tests ref> <ompi version>
 # Called by build_vr_pack.sh on the build tray, after Open MPI and nccl-tests
 # are in <pack dir>. Completes the pack:
-#   - copies the stock libnccl.so.2 and the CUDA runtime into lib/
+#   - copies libnccl.so.2 (from $NCCL_DIR/lib, the fetched 2.32.6) and the
+#     CUDA runtime into lib/
 #   - copies every other shared library the pack's binaries and Open MPI
 #     plugins need, except the base-OS floor (glibc, libstdc++, libgcc_s,
 #     libz, libudev -- same floor as the GB300 pack) and the GPU driver
@@ -11,7 +12,6 @@
 #     PACK_LIBS (the ldd audit)
 set -euo pipefail
 PACK="$1"; TESTS_REF="$2"; OMPI_VERSION="$3"
-ARCH_LIB="/usr/lib/$(uname -m)-linux-gnu"
 cd "$PACK"
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
@@ -26,7 +26,8 @@ copy_lib() {  # <path of any name of the lib>
   [[ "$so" != "$(basename "$real")" ]] && ln -sf "$(basename "$real")" "lib/$so"
   return 0
 }
-copy_lib "$ARCH_LIB/libnccl.so.2"
+[[ -n "${NCCL_DIR:-}" && -e "$NCCL_DIR/lib/libnccl.so.2" ]] || { echo "ERROR: NCCL_DIR/lib/libnccl.so.2 not set or missing" >&2; exit 1; }
+copy_lib "$NCCL_DIR/lib/libnccl.so.2"
 copy_lib "$(ls "$CUDA_HOME"/lib64/libcudart.so.[0-9]* | sort -V | head -1)"   # libcudart.so.13
 
 # Everything else the binaries / plugins resolve outside the pack
@@ -56,7 +57,7 @@ for b in bin/all_reduce_perf bin/alltoall_perf; do
 done
 LD_LIBRARY_PATH="$PACK/lib" ldd bin/all_reduce_perf > PACK_LIBS
 
-NCCL_V=$(dpkg-query -W -f='${Version}' libnccl2)
+NCCL_V="${NCCL_INFO:-$(dpkg-query -W -f='${Version}' libnccl2)}"
 CUDA_V=$(sed -n '/"cuda"/,/}/{s/.*"version" *: *"\([^"]*\)".*/\1/p}' "$CUDA_HOME/version.json" 2>/dev/null | head -1)
 [[ -n "$CUDA_V" ]] || CUDA_V=$("$CUDA_HOME/bin/nvcc" --version | grep -oE 'V[0-9.]+' | tr -d V | head -1)
 cat > PACK_INFO <<INFO

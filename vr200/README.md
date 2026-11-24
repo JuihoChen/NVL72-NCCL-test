@@ -11,7 +11,7 @@ repo are untouched; everything VR200 lives in this folder.
 | Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
 | Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
 | Open MPI | 4.1.6 `--without-slurm`, in the pack | same |
-| NCCL | 2.28.7 (built from tag), in the pack | the tray's stock `libnccl2 2.32.6-1+cuda13.5`, copied into the pack |
+| NCCL | 2.28.7 (built from tag), in the pack | stock 2.32.6-1+cuda13.5 release `.deb`s (or the `v2.32.6-1` tag), fetched by the build, in the pack |
 | CUDA runtime | 13.0, in the pack | 13.5, in the pack |
 | nccl-tests | v2.17.8, in the pack | your checkout (or `--nccl-tests-ref`), built for the tray's GPU arch |
 | Default data dir | `/root/portable-nccl` | same |
@@ -27,9 +27,9 @@ Pre-flight lines are labelled `nNN/IP` like GB300.
 
 ## 1. Build the pack (once, natively on one VR200 tray)
 
-The pack is built on a tray that already has the target stack (CUDA 13.5
-toolkit, `libnccl2` + `libnccl-dev` `2.32.6-1+cuda13.5`). It needs no root,
-no Docker and no extra packages, and changes nothing on the system:
+The pack is built on a tray with the CUDA 13.5 toolkit. It needs no root,
+no Docker and no extra packages, and changes nothing on the system (the
+tray's own libnccl2, e.g. a 2.32.4 dev drop, is neither used nor touched):
 
 ```bash
 # on the build tray (e.g. node136, as nvidia)
@@ -40,30 +40,40 @@ bash ~/NVL72-NCCL-test/vr200/pack/build_vr_pack.sh --nccl-tests-src ~/nccl-tests
 
 `pack/build_vr_pack.sh`:
 
-1. Checks the tray: aarch64, `nvcc`, `libnccl2` == `libnccl-dev` ==
-   `2.32.6-1+cuda13.5` (`EXPECT_NCCL`, `""` accepts any).
-2. Builds Open MPI 4.1.6 `--without-slurm` (as GB300) into its own prefix
+1. Checks the tray: aarch64, `nvcc`, the GPUs' compute capability.
+2. Fetches NCCL `2.32.6-1+cuda13.5` (`NCCL_VERSION`) into
+   `~/vr-pack-build/nccl` (`include/` + `lib/`). First match wins:
+   `--nccl-debs <dir>` (libnccl2 + libnccl-dev `.deb`s, e.g. from the
+   release drop), then `apt-get download` from the tray's apt lists, then
+   the `.deb`s from NVIDIA's CUDA repo (`NCCL_REPO_URLS`, ubuntu2604 then
+   ubuntu2404 sbsa), all unpacked with `dpkg-deb -x` (no root). If none has
+   it, the stock `NVIDIA/nccl` tag `v2.32.6-1` is built for the tray's GPU
+   arch (slow; `--nccl-source` forces it). The header and the library must
+   both be 2.32.6.
+3. Builds Open MPI 4.1.6 `--without-slurm` (as GB300) into its own prefix
    `~/vr-pack-build/pack`, with Open MPI's bundled PMIx / libevent / hwloc,
    so it cannot clash with the system Open MPI 5 and needs no `-dev`
    packages. UCX is used when `libucx-dev` is installed. `-std=gnu17` keeps
    GCC 15 (Ubuntu 26.04) from compiling the 4.1 sources as C23. The
    download needs internet; otherwise `--ompi-tarball <file>`. It is built
    once and reused (`--clean` rebuilds).
-3. Copies `--nccl-tests-src` (default `~/nccl-tests`; your checkout and its
+4. Copies `--nccl-tests-src` (default `~/nccl-tests`; your checkout and its
    `build/` are left alone; `--nccl-tests-ref <tag>` picks a tag) and builds
-   it with `MPI=1` against that Open MPI and the system NCCL. The GPU
+   it with `MPI=1` against that Open MPI and the fetched NCCL
+   (`NCCL_HOME=~/vr-pack-build/nccl`, not `/usr`). The GPU
    architecture comes from this tray's GPUs (`nvidia-smi --query-gpu=compute_cap`,
    SASS + PTX), so the Rubin GPUs are targeted; `NVCC_GENCODE` overrides.
-4. `assemble_pack.sh` copies `libnccl.so.2` (the system 2.32.6),
+5. `assemble_pack.sh` copies `libnccl.so.2` (the fetched 2.32.6),
    `libcudart.so.13` and every other library the binaries and Open MPI
    plugins need into `lib/`, except the base-OS floor the GB300 audit found
    (glibc, `libstdc++`, `libgcc_s`, `libz`, `libudev`) and the driver
    (`libcuda`, `libnvidia-*`). It fails if anything else is unresolved, or if
    a test binary would load a non-pack NCCL. It writes `PACK_INFO`
    (versions, checked by the pre-flight) and `PACK_LIBS` (the `ldd` audit).
-5. Smoke run: the pack's own `mpirun` runs `all_reduce_perf` on the 4 GPUs
+6. Smoke run: the pack's own `mpirun` runs `all_reduce_perf` on the 4 GPUs
    of the build tray with only the pack's libraries (`--no-smoke` skips it).
-   The tarball is only written if that passes.
+   With `NCCL_DEBUG=VERSION`, the loaded NCCL must report 2.32.6. The
+   tarball is only written if that passes.
 
 Then copy the tarball next to `deploy_vr_nccl_test.sh` on the jumper.
 

@@ -4,12 +4,19 @@
 # The VR200 counterpart of the GB300 pack (nccl-test-pack-arm64.tar.gz): a
 # small tar.gz with the nccl-tests *_perf binaries, a private Open MPI 4.1.6
 # built --without-slurm (mpirun/orterun/orted/ompi_info + MCA plugins), the
-# tray's stock NCCL library and the CUDA runtime. deploy_vr_nccl_test.sh
+# stock NCCL 2.32.6 library and the CUDA runtime. deploy_vr_nccl_test.sh
 # pushes it to every tray.
 #
-# Run it on one VR200 tray that has the target stack installed (CUDA 13.5
-# toolkit, libnccl2 + libnccl-dev 2.32.6-1+cuda13.5). It needs no root and
+# Run it on one VR200 tray with the CUDA 13.5 toolkit. It needs no root and
 # changes nothing on the system:
+#   - NCCL 2.32.6-1+cuda13.5 is fetched into <work>/nccl, whatever NCCL the
+#     tray itself has (the system libnccl2 is not used or touched). First
+#     match wins:
+#       1. --nccl-debs <dir> with libnccl2_* + libnccl-dev_*.deb (release drop)
+#       2. "apt-get download" (no root needed) if the tray's apt lists have it
+#       3. the .debs from NVIDIA's CUDA repo (NCCL_REPO_URLS)
+#       4. a build of the NVIDIA/nccl tag v2.32.6-1 (slow, ~20-40 min;
+#          --nccl-source forces this). Stock sources, no patches.
 #   - Open MPI 4.1.6 is built into its own prefix (<work>/pack), with its own
 #     bundled PMIx / libevent / hwloc, so it cannot clash with the system's
 #     Open MPI 5 and needs no -dev packages
@@ -22,6 +29,7 @@
 #   bash build_vr_pack.sh                         # work dir ~/vr-pack-build
 #   bash build_vr_pack.sh --nccl-tests-src ~/nccl-tests --nccl-tests-ref v2.17.8
 #   bash build_vr_pack.sh --ompi-tarball ~/openmpi-4.1.6.tar.gz   # tray without internet
+#   bash build_vr_pack.sh --nccl-debs ~/drop/     # NCCL .debs you already have
 #   bash build_vr_pack.sh --no-smoke              # skip the 4-GPU test run
 #   bash build_vr_pack.sh --clean                 # rebuild Open MPI too
 #
@@ -29,7 +37,8 @@
 # <work>/nccl-test-pack-vr-arm64.tar.gz), --nccl-tests-repo <url> (used when
 # --nccl-tests-src is not a checkout; default github NVIDIA/nccl-tests).
 # Environment: CUDA_HOME (default /usr/local/cuda), NVCC_GENCODE,
-# EXPECT_NCCL (default 2.32.6-1+cuda13.5; "" accepts any), OMPI_VERSION (4.1.6).
+# NCCL_VERSION (default 2.32.6-1+cuda13.5), OMPI_VERSION (4.1.6),
+# NCCL_REPO_URLS (CUDA repo folders to try for the .debs).
 #
 # The pack's PACK_INFO lists what went in; run_vr_nccl_test.sh checks it.
 
@@ -46,7 +55,10 @@ SMOKE=1
 CLEAN=0
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 NVCC_GENCODE="${NVCC_GENCODE:-}"
-EXPECT_NCCL="${EXPECT_NCCL-2.32.6-1+cuda13.5}"
+NCCL_VERSION="${NCCL_VERSION:-2.32.6-1+cuda13.5}"
+NCCL_REPO_URLS="${NCCL_REPO_URLS:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/sbsa https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa}"
+NCCL_DEBS=""
+NCCL_SOURCE=0
 OMPI_VERSION="${OMPI_VERSION:-4.1.6}"
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +69,8 @@ while [[ $# -gt 0 ]]; do
     --nccl-tests-ref)  TESTS_REF="$2"; shift 2 ;;
     --nccl-tests-repo) TESTS_REPO="$2"; shift 2 ;;
     --ompi-tarball)    OMPI_TARBALL="$2"; shift 2 ;;
+    --nccl-debs)       NCCL_DEBS="${2%/}"; shift 2 ;;
+    --nccl-source)     NCCL_SOURCE=1; shift ;;
     --no-smoke)        SMOKE=0; shift ;;
     --clean)           CLEAN=1; shift ;;
     -h|--help)         awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
@@ -65,7 +79,6 @@ while [[ $# -gt 0 ]]; do
 done
 OUT="${OUT:-$WORK/nccl-test-pack-vr-arm64.tar.gz}"
 PACK="$WORK/pack"
-ARCH_LIB="/usr/lib/$(uname -m)-linux-gnu"
 step() { echo; echo "=== $* ==="; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
@@ -75,14 +88,9 @@ step "Checking the build tray"
 for t in gcc g++ make tar sha256sum objdump ldd; do command -v "$t" >/dev/null || die "'$t' not found (build-essential / binutils)"; done
 [[ -x "$CUDA_HOME/bin/nvcc" ]] || die "no nvcc at $CUDA_HOME/bin (set CUDA_HOME)"
 NVCC_V=$("$CUDA_HOME/bin/nvcc" --version | grep -oE 'V[0-9.]+' | head -1)
-NCCL_V=$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null || echo none)
-NCCL_DEV_V=$(dpkg-query -W -f='${Version}' libnccl-dev 2>/dev/null || echo none)
-[[ -f /usr/include/nccl.h ]] || die "no /usr/include/nccl.h: install libnccl-dev $NCCL_V (same version as libnccl2)"
-[[ "$NCCL_DEV_V" == "$NCCL_V" ]] || die "libnccl-dev $NCCL_DEV_V != libnccl2 $NCCL_V"
-[[ -z "$EXPECT_NCCL" || "$NCCL_V" == "$EXPECT_NCCL" ]] || die "libnccl2 is $NCCL_V, expected $EXPECT_NCCL (EXPECT_NCCL=\"\" to accept it)"
-NCCL_SO=$(readlink -f "$ARCH_LIB/libnccl.so.2" 2>/dev/null || true)
-[[ -f "$NCCL_SO" ]] || die "no $ARCH_LIB/libnccl.so.2"
-echo "  CUDA $NVCC_V ($CUDA_HOME) | libnccl2 $NCCL_V ($NCCL_SO) | $(gcc --version | head -1)"
+SYS_NCCL=$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null || echo none)
+echo "  CUDA $NVCC_V ($CUDA_HOME) | $(gcc --version | head -1)"
+echo "  system libnccl2: $SYS_NCCL (not used: the pack gets NCCL $NCCL_VERSION)"
 
 # GPU architecture: this tray's GPUs (e.g. compute_cap 10.3 -> sm_103)
 if [[ -z "$NVCC_GENCODE" ]]; then
@@ -103,11 +111,80 @@ echo "  nccl-tests gencode: ${NVCC_GENCODE:-nccl-tests default}"
 mkdir -p "$WORK"
 cd "$WORK"
 JOBS=$(nproc)
+
+# --- 1. NCCL 2.32.6, into <work>/nccl (include/ + lib/), never the system --------
+NCCL_DIR="$WORK/nccl"
+step "NCCL $NCCL_VERSION -> $NCCL_DIR"
+nccl_have() { [[ -f "$NCCL_DIR/include/nccl.h" && -e "$NCCL_DIR/lib/libnccl.so.2" && "$(cat "$NCCL_DIR/VERSION" 2>/dev/null)" == "$NCCL_VERSION"* ]]; }
+# unpack libnccl2 + libnccl-dev .debs (no root: dpkg-deb -x) into include/ + lib/
+nccl_from_debs() {  # <dir with libnccl2_*.deb and libnccl-dev_*.deb>
+  local d="$1" lib dev v
+  lib=$(ls "$d"/libnccl2_"${NCCL_VERSION}"_*.deb 2>/dev/null | head -1)
+  dev=$(ls "$d"/libnccl-dev_"${NCCL_VERSION}"_*.deb 2>/dev/null | head -1)
+  [[ -n "$lib" && -n "$dev" ]] || return 1
+  v=$(dpkg-deb -f "$lib" Version)
+  [[ "$v" == "$NCCL_VERSION" && "$(dpkg-deb -f "$dev" Version)" == "$NCCL_VERSION" ]] || return 1
+  rm -rf "$NCCL_DIR" "$WORK/nccl-root" && mkdir -p "$NCCL_DIR" "$WORK/nccl-root"
+  dpkg-deb -x "$lib" "$WORK/nccl-root" && dpkg-deb -x "$dev" "$WORK/nccl-root" || return 1
+  mv "$WORK/nccl-root/usr/include" "$NCCL_DIR/include"
+  mv "$WORK/nccl-root/usr/lib/$(uname -m)-linux-gnu" "$NCCL_DIR/lib"
+  rm -rf "$WORK/nccl-root"
+  echo "$v (release .debs: $(basename "$lib"), $(basename "$dev"))" > "$NCCL_DIR/VERSION"
+}
+if nccl_have && [[ -z "$NCCL_DEBS" && $NCCL_SOURCE -eq 0 ]]; then
+  echo "  already there: $(cat "$NCCL_DIR/VERSION")"
+else
+  GOT=0
+  DL="$WORK/nccl-debs"; mkdir -p "$DL"
+  if [[ $NCCL_SOURCE -eq 0 && -n "$NCCL_DEBS" ]]; then
+    nccl_from_debs "$NCCL_DEBS" && GOT=1 || die "no libnccl2_/libnccl-dev_${NCCL_VERSION}_*.deb in $NCCL_DEBS"
+  fi
+  if [[ $GOT -eq 0 && $NCCL_SOURCE -eq 0 ]]; then
+    echo "  trying: apt-get download (the tray's apt lists)"
+    if (cd "$DL" && apt-get download -q "libnccl2=$NCCL_VERSION" "libnccl-dev=$NCCL_VERSION" >/dev/null 2>&1); then
+      nccl_from_debs "$DL" && GOT=1
+    fi
+  fi
+  if [[ $GOT -eq 0 && $NCCL_SOURCE -eq 0 ]]; then
+    for u in $NCCL_REPO_URLS; do
+      echo "  trying: $u"
+      ok=1
+      for pkg in libnccl2 libnccl-dev; do
+        f="${pkg}_${NCCL_VERSION}_arm64.deb"
+        [[ -f "$DL/$f" ]] && continue
+        { command -v wget >/dev/null && wget -q -O "$DL/$f.part" "$u/$f"; } || curl -fsSL -o "$DL/$f.part" "$u/$f" \
+          || { rm -f "$DL/$f.part"; ok=0; break; }
+        mv "$DL/$f.part" "$DL/$f"
+      done
+      [[ $ok -eq 1 ]] && nccl_from_debs "$DL" && { GOT=1; break; }
+    done
+  fi
+  if [[ $GOT -eq 0 ]]; then
+    # Stock source of the same release, built for this tray's GPU arch
+    TAG="v${NCCL_VERSION%%+*}"            # 2.32.6-1+cuda13.5 -> v2.32.6-1
+    echo "  no .debs found: building NCCL from the NVIDIA/nccl tag $TAG (slow)"
+    rm -rf "$WORK/nccl-src"
+    git clone -q --depth 1 -b "$TAG" https://github.com/NVIDIA/nccl.git "$WORK/nccl-src" \
+      || die "could not get NCCL $NCCL_VERSION: no .debs and no tag $TAG. Copy libnccl2_/libnccl-dev_${NCCL_VERSION}_arm64.deb here and use --nccl-debs <dir>"
+    NMK=(src.build "CUDA_HOME=$CUDA_HOME" "BUILDDIR=$WORK/nccl-src/build")
+    [[ -n "$NVCC_GENCODE" ]] && NMK+=("NVCC_GENCODE=$NVCC_GENCODE")
+    make -C "$WORK/nccl-src" -j"$JOBS" "${NMK[@]}" > "$WORK/nccl_build.log" 2>&1 \
+      || { tail -30 "$WORK/nccl_build.log"; die "NCCL build failed (log: $WORK/nccl_build.log)"; }
+    rm -rf "$NCCL_DIR" && mkdir -p "$NCCL_DIR"
+    cp -a "$WORK/nccl-src/build/include" "$WORK/nccl-src/build/lib" "$NCCL_DIR/"
+    echo "${NCCL_VERSION} (built from NVIDIA/nccl $TAG, gencode ${NVCC_GENCODE:-default})" > "$NCCL_DIR/VERSION"
+  fi
+fi
+nccl_have || die "NCCL in $NCCL_DIR is incomplete"
+# The header and the library must both be the wanted release
+HV=$(awk '/define NCCL_MAJOR/{a=$3} /define NCCL_MINOR/{b=$3} /define NCCL_PATCH/{c=$3} END{print a"."b"."c}' "$NCCL_DIR/include/nccl.h")
+[[ "$NCCL_VERSION" == "$HV"-* ]] || die "$NCCL_DIR/include/nccl.h is $HV, expected $NCCL_VERSION"
+echo "  NCCL $(cat "$NCCL_DIR/VERSION") | nccl.h $HV | $(basename "$(readlink -f "$NCCL_DIR/lib/libnccl.so.2")")"
 # GCC 15 (Ubuntu 26.04) defaults to C23, which older C code such as Open MPI
 # 4.1's bundled libraries may not compile as; pin the dialect Open MPI 4.1 was written for
 OMPI_CFLAGS="-O2 -std=gnu17"
 
-# --- 1. Open MPI 4.1.6 --without-slurm, into the pack prefix ----------------------
+# --- 2. Open MPI 4.1.6 --without-slurm, into the pack prefix ----------------------
 step "Open MPI $OMPI_VERSION -> $PACK (own prefix, bundled PMIx/libevent/hwloc)"
 [[ $CLEAN -eq 1 ]] && rm -rf "$PACK" "openmpi-$OMPI_VERSION"
 if [[ -x "$PACK/bin/orted" && "$("$PACK/bin/ompi_info" --version 2>/dev/null | head -1)" == *"v$OMPI_VERSION"* ]]; then
@@ -139,7 +216,7 @@ else
 fi
 "$PACK/bin/ompi_info" | grep -qE "MCA [a-z]+: slurm" && die "this Open MPI has Slurm support compiled in (expected --without-slurm)"
 
-# --- 2. nccl-tests against the pack's Open MPI + the system NCCL ---------------
+# --- 3. nccl-tests against the pack's Open MPI + NCCL 2.32.6 ------------------
 step "nccl-tests (MPI=1) from $TESTS_SRC"
 rm -rf "$WORK/nccl-tests"
 if [[ -f "$TESTS_SRC/Makefile" ]]; then
@@ -154,20 +231,21 @@ if [[ -n "$TESTS_REF" ]]; then
 fi
 TESTS_DESC=$(git -C "$WORK/nccl-tests" describe --tags --always --dirty 2>/dev/null || echo "unknown (not a git checkout)")
 echo "  nccl-tests $TESTS_DESC"
-MK=(MPI=1 "MPI_HOME=$PACK" "CUDA_HOME=$CUDA_HOME" NCCL_HOME=/usr)
+MK=(MPI=1 "MPI_HOME=$PACK" "CUDA_HOME=$CUDA_HOME" "NCCL_HOME=$NCCL_DIR")
 [[ -n "$NVCC_GENCODE" ]] && MK+=("NVCC_GENCODE=$NVCC_GENCODE")
 make -C "$WORK/nccl-tests" -j"$JOBS" "${MK[@]}" > "$WORK/nccl_tests_build.log" 2>&1 \
   || { tail -30 "$WORK/nccl_tests_build.log"; die "nccl-tests build failed (log: $WORK/nccl_tests_build.log)"; }
 cp "$WORK"/nccl-tests/build/*_perf "$PACK/bin/"
 echo "  $(ls "$WORK"/nccl-tests/build/*_perf | wc -l) *_perf binaries -> $PACK/bin"
 
-# --- 3. libraries + PACK_INFO ------------------------------------------------------
+# --- 4. libraries + PACK_INFO ------------------------------------------------------
 step "Assembling lib/ and PACK_INFO"
 rm -f "$PACK"/lib/libnccl.so* "$PACK"/lib/libcudart.so*
-CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" \
+CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" NCCL_DIR="$NCCL_DIR" \
+  NCCL_INFO="$(cat "$NCCL_DIR/VERSION")" NCCL_VERSION="$NCCL_VERSION" \
   bash "$HERE/assemble_pack.sh" "$PACK" "$TESTS_DESC" "$OMPI_VERSION"
 
-# --- 4. smoke run: the pack's own mpirun, 4 GPUs on this tray ---------------------
+# --- 5. smoke run: the pack's own mpirun, 4 GPUs on this tray ---------------------
 if [[ $SMOKE -eq 1 ]]; then
   step "Smoke run: pack mpirun, all_reduce_perf, 4 GPUs on $(hostname)"
   ROOT=(); [[ $EUID -eq 0 ]] && ROOT=(--allow-run-as-root)
@@ -175,14 +253,17 @@ if [[ $SMOKE -eq 1 ]]; then
   if env -u LD_LIBRARY_PATH OPAL_PREFIX="$PACK" PATH="$PACK/bin:/usr/bin:/bin" LD_LIBRARY_PATH="$PACK/lib" \
        "$PACK/bin/mpirun" --mca schizo ompi "${ROOT[@]}" -np 4 --host localhost:4 --bind-to none \
        --mca pml ob1 --mca btl self,tcp --mca mca_base_component_show_load_errors 0 \
-       -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH -x NCCL_DEBUG=WARN \
+       -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH -x NCCL_DEBUG=VERSION \
        "$PACK/bin/all_reduce_perf" -b 8 -e 256M -f 4 -g 1 2>&1 | tee "$WORK/smoke.log"; then :; fi
   grep -q "Avg bus bandwidth" "$WORK/smoke.log" && ! grep -q "Out of bounds values : [1-9]" "$WORK/smoke.log" \
     || die "smoke run failed (log: $WORK/smoke.log); the pack was NOT written"
+  # NCCL_DEBUG=VERSION: NCCL prints the version it actually loaded
+  grep -q "NCCL version ${NCCL_VERSION%%-*}" "$WORK/smoke.log" \
+    || die "smoke run did not load NCCL ${NCCL_VERSION%%-*} ($(grep -o 'NCCL version [^ ]*' "$WORK/smoke.log" | head -1)); the pack was NOT written"
   echo "  smoke run OK"
 fi
 
-# --- 5. tar it up: same top-level layout as the GB300 pack -------------------------
+# --- 6. tar it up: same top-level layout as the GB300 pack -------------------------
 step "Writing $OUT"
 tar -C "$PACK" -czf "$OUT.part" bin lib share PACK_INFO PACK_LIBS && mv "$OUT.part" "$OUT"
 cat "$PACK/PACK_INFO"
