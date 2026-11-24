@@ -9,7 +9,7 @@ repo are untouched; everything VR200 lives in this folder.
 | Pack build | `nccl_arm64.Dockerfile` (in `../GB300_mpirun_NCCL_diag_deployment.md`) | `pack/build_vr_pack.sh`, natively on a VR200 tray (no Docker) |
 | Pack | `nccl-test-pack-arm64.tar.gz` | `nccl-test-pack-vr-arm64.tar.gz` |
 | Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
-| Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh`, staged with the rack settings injected |
+| Test, on node-00 | generated `run_nccl_test.sh` | generated `run_vr_nccl_test.sh` (embedded in the deploy script, rack settings injected) |
 | Open MPI | 4.1.6 `--without-slurm`, in the pack | same |
 | NCCL | 2.28.7 (built from tag), in the pack | stock 2.32.6-1+cuda13.5 release `.deb`s (or the `v2.32.6-1` tag), fetched by the build, in the pack |
 | CUDA runtime | 13.0, in the pack | 13.5, in the pack |
@@ -126,8 +126,9 @@ picks it). Steps:
 2. SSH mesh node-00 -> every tray, itself included, verified from node-00.
 3. `run_vr_nccl_test.sh` is staged in `<data-dir>/run/` on node-00 with
    the rack settings (hosts, pack paths, UUID, pinned versions) injected
-   into it, like GB300's generated `run_nccl_test.sh`: one ready-to-run
-   file, nothing else to copy.
+   into it, like GB300's generated `run_nccl_test.sh`. The runner is
+   embedded in `deploy_vr_nccl_test.sh`, so the jumper needs only that one
+   script and the pack tarball.
 4. `run_vr_nccl_test.sh --check` runs the full pre-flight on node-00; the
    deploy exits non-zero if it fails (`--no-check` skips it).
 

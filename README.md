@@ -8,7 +8,8 @@ files above. `vr200/pack/build_vr_pack.sh`, run on one VR200 tray, builds a port
 (`nccl-test-pack-vr-arm64.tar.gz`: Open MPI 4.1.6 `--without-slurm`, stock
 NCCL 2.32.6+cuda13.5, CUDA 13.5 runtime, nccl-tests).
 `vr200/deploy_vr_nccl_test.sh` pushes it to every tray from the jumper and
-stages `run_vr_nccl_test.sh` on node-00. See [vr200/README.md](vr200/README.md).
+generates `run_vr_nccl_test.sh` on node-00. The jumper needs only that one
+script and the tarball. See [vr200/README.md](vr200/README.md).
 
 ```bash
 bash vr200/pack/build_vr_pack.sh        # on one VR200 tray; copy the tarball to vr200/
