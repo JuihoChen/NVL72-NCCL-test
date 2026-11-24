@@ -4,14 +4,15 @@ Deployment scripts and diagnostics for NCCL tests on 18-node/72-GPU GB300 racks 
 ## VR200 (Vera Rubin NVL72) compute trays
 
 `vr200/` applies the same flow to VR200 trays, without changing the GB300
-files above. `vr200/pack/build_vr_pack.sh` builds a portable pack
+files above. `vr200/pack/build_vr_pack.sh`, run on one VR200 tray, builds a portable pack
 (`nccl-test-pack-vr-arm64.tar.gz`: Open MPI 4.1.6 `--without-slurm`, stock
 NCCL 2.32.6+cuda13.5, CUDA 13.5 runtime, nccl-tests).
 `vr200/deploy_vr_nccl_test.sh` pushes it to every tray from the jumper and
 stages `run_vr_nccl_test.sh` on node-00. See [vr200/README.md](vr200/README.md).
 
 ```bash
-cd vr200 && (cd pack && ./build_vr_pack.sh)
+bash vr200/pack/build_vr_pack.sh        # on one VR200 tray; copy the tarball to vr200/
+cd vr200
 ./deploy_vr_nccl_test.sh rackNN.sh --auto
 ```
 

@@ -6,14 +6,14 @@ repo are untouched; everything VR200 lives in this folder.
 
 | | GB300 | VR200 |
 |---|---|---|
-| Pack build | `nccl_arm64.Dockerfile` (in `../GB300_mpirun_NCCL_diag_deployment.md`) | `pack/build_vr_pack.sh` + `pack/nccl_vr_arm64.Dockerfile` |
+| Pack build | `nccl_arm64.Dockerfile` (in `../GB300_mpirun_NCCL_diag_deployment.md`) | `pack/build_vr_pack.sh`, natively on a VR200 tray (no Docker) |
 | Pack | `nccl-test-pack-arm64.tar.gz` | `nccl-test-pack-vr-arm64.tar.gz` |
 | Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
 | Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
 | Open MPI | 4.1.6 `--without-slurm`, in the pack | same |
-| NCCL | 2.28.7 (built from tag), in the pack | stock `libnccl2 2.32.6-1+cuda13.5` release package, in the pack |
+| NCCL | 2.28.7 (built from tag), in the pack | the tray's stock `libnccl2 2.32.6-1+cuda13.5`, copied into the pack |
 | CUDA runtime | 13.0, in the pack | 13.5, in the pack |
-| nccl-tests | v2.17.8, in the pack | same tag (overridable) |
+| nccl-tests | v2.17.8, in the pack | your checkout (or `--nccl-tests-ref`), built for the tray's GPU arch |
 | Default data dir | `/root/portable-nccl` | same |
 
 Only the GPU driver and IMEX come from the trays. Nothing on the trays is
@@ -25,35 +25,47 @@ Identical hostnames on all trays are fine again: they only hung the system
 Open MPI 5 used during bring-up (finding 3), not the pack's Open MPI 4.
 Pre-flight lines are labelled `nNN/IP` like GB300.
 
-## 1. Build the pack (once, any Docker host)
+## 1. Build the pack (once, natively on one VR200 tray)
+
+The pack is built on a tray that already has the target stack (CUDA 13.5
+toolkit, `libnccl2` + `libnccl-dev` `2.32.6-1+cuda13.5`). It needs no root,
+no Docker and no extra packages, and changes nothing on the system:
 
 ```bash
-cd vr200/pack
-./build_vr_pack.sh                         # -> vr200/nccl-test-pack-vr-arm64.tar.gz
-./build_vr_pack.sh --nccl-debs ~/vr-drop/  # NCCL .debs from the release drop instead of apt
+# on the build tray (e.g. node136, as nvidia)
+cd ~ && git clone -b vr200-deploy https://github.com/JuihoChen/NVL72-NCCL-test.git
+bash ~/NVL72-NCCL-test/vr200/pack/build_vr_pack.sh --nccl-tests-src ~/nccl-tests
+#   -> ~/vr-pack-build/nccl-test-pack-vr-arm64.tar.gz
 ```
 
-On an aarch64 host it builds natively. On x86 it needs `docker buildx` with
-arm64 emulation (qemu/binfmt), like the GB300 pack. Steps, in
-`nccl_vr_arm64.Dockerfile`:
+`pack/build_vr_pack.sh`:
 
-1. Base image `nvcr.io/nvidia/cuda:13.5.0-devel-ubuntu24.04` (`CUDA_IMAGE`).
-2. Open MPI 4.1.6, configured like GB300 (`--without-slurm --with-ucx
-   --disable-mpi-fortran`, distro PMIx), installed straight into
-   `/opt/pack`.
-3. NCCL: `libnccl2` / `libnccl-dev` `2.32.6-1+cuda13.5`
-   (`NCCL_DEB_VERSION`) from the CUDA apt repo, or the `.deb` files given
-   with `--nccl-debs`. The build fails unless exactly that version, and one
-   `libnccl.so.2`, is left (a CUDA image's own libnccl cannot be picked up
-   by mistake, the GB300 "delete pre-bundled libnccl" lesson).
-4. nccl-tests `v2.17.8` (`NCCL_TESTS_REF`) with `MPI=1` against both.
-5. `assemble_pack.sh` copies `libnccl.so.2`, `libcudart.so.13` and every
-   other library the binaries and Open MPI plugins need into `lib/`, except
-   the base-OS floor the GB300 audit found (glibc, `libstdc++`, `libgcc_s`,
-   `libz`, `libudev`) and the driver (`libcuda`, `libnvidia-*`). It fails if
-   anything else is unresolved, or if a test binary would load a non-pack
-   NCCL. It writes `PACK_INFO` (versions, checked by the pre-flight) and
-   `PACK_LIBS` (the `ldd` audit).
+1. Checks the tray: aarch64, `nvcc`, `libnccl2` == `libnccl-dev` ==
+   `2.32.6-1+cuda13.5` (`EXPECT_NCCL`, `""` accepts any).
+2. Builds Open MPI 4.1.6 `--without-slurm` (as GB300) into its own prefix
+   `~/vr-pack-build/pack`, with Open MPI's bundled PMIx / libevent / hwloc,
+   so it cannot clash with the system Open MPI 5 and needs no `-dev`
+   packages. UCX is used when `libucx-dev` is installed. `-std=gnu17` keeps
+   GCC 15 (Ubuntu 26.04) from compiling the 4.1 sources as C23. The
+   download needs internet; otherwise `--ompi-tarball <file>`. It is built
+   once and reused (`--clean` rebuilds).
+3. Copies `--nccl-tests-src` (default `~/nccl-tests`; your checkout and its
+   `build/` are left alone; `--nccl-tests-ref <tag>` picks a tag) and builds
+   it with `MPI=1` against that Open MPI and the system NCCL. The GPU
+   architecture comes from this tray's GPUs (`nvidia-smi --query-gpu=compute_cap`,
+   SASS + PTX), so the Rubin GPUs are targeted; `NVCC_GENCODE` overrides.
+4. `assemble_pack.sh` copies `libnccl.so.2` (the system 2.32.6),
+   `libcudart.so.13` and every other library the binaries and Open MPI
+   plugins need into `lib/`, except the base-OS floor the GB300 audit found
+   (glibc, `libstdc++`, `libgcc_s`, `libz`, `libudev`) and the driver
+   (`libcuda`, `libnvidia-*`). It fails if anything else is unresolved, or if
+   a test binary would load a non-pack NCCL. It writes `PACK_INFO`
+   (versions, checked by the pre-flight) and `PACK_LIBS` (the `ldd` audit).
+5. Smoke run: the pack's own `mpirun` runs `all_reduce_perf` on the 4 GPUs
+   of the build tray with only the pack's libraries (`--no-smoke` skips it).
+   The tarball is only written if that passes.
+
+Then copy the tarball next to `deploy_vr_nccl_test.sh` on the jumper.
 
 Pack layout (same as GB300, plus the two info files):
 
@@ -62,7 +74,7 @@ bin/      *_perf (nccl-tests), mpirun, orterun, orted, ompi_info, ...
 lib/      libmpi.so.40, libopen-rte/-pal, libpmix, libhwloc, libevent*, libucx*,
           libnccl.so.2 (2.32.6), libcudart.so.13, lib/openmpi/ (MCA plugins)
 share/    openmpi help files, wrapper data
-PACK_INFO nccl=2.32.6-1+cuda13.5, cuda=13.5.0, openmpi=4.1.6, nccl_tests=v2.17.8, ...
+PACK_INFO nccl=2.32.6-1+cuda13.5, cuda=13.5.x, openmpi=4.1.6, nccl_tests=<git describe>, gencode, built_on, ...
 PACK_LIBS ldd of all_reduce_perf against the pack
 ```
 
