@@ -117,9 +117,14 @@
 # fail-fast mesh check points at that jumper-side redeploy instead. A
 # repair_ssh_mesh.sh left on node-00 by an older deploy is not touched.
 
+# v0.24: run_nccl_test.sh's pre-flight lines are labelled nNN/IP (position
+# in the IMEX node list + IP, e.g. [n07/192.168.41.147]) instead of
+# [\$(hostname)]: on some racks every node has the same hostname, which made
+# all 18 lines read [carlonext]. The label matches run_gpu_rank.sh's output.
+
 set -euo pipefail
 
-SCRIPT_VERSION="0.23"
+SCRIPT_VERSION="0.24"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -545,8 +550,14 @@ for ip in "\${NODES[@]}"; do
   fi
   ssh \$SSH_OPTS "root@\${ip}" PACK_DIR="\$PACK_DIR" PACK_CACHE="\$PACK_CACHE" bash -s <<'REMOTE'
 set -e
+# Every node of a rack can share one hostname, so label lines by position
+# in the IMEX node list (written just above) plus IP, the same nNN/IP form
+# the GPU ranking uses: n00 = node-00. Falls back to the hostname; never
+# fails (|| true), since this script runs under set -e.
+NODE_LABEL=\$(awk -v me=" \$(hostname -I 2>/dev/null) " 'NF { if (index(me, " " \$1 " ")) { printf "n%02d/%s", n, \$1; exit } n++ }' ${IMEX_CFG} 2>/dev/null || true)
+NODE_LABEL=\${NODE_LABEL:-\$(hostname)}
 if ! systemctl is-active --quiet nvidia-imex; then
-  echo "  [\$(hostname)] nvidia-imex not active -- restarting..."
+  echo "  [\$NODE_LABEL] nvidia-imex not active -- restarting..."
   systemctl restart nvidia-imex
   ok=0
   for attempt in \$(seq 1 ${IMEX_WAIT_ATTEMPTS}); do
@@ -554,14 +565,14 @@ if ! systemctl is-active --quiet nvidia-imex; then
     sleep ${IMEX_WAIT_SLEEP}
   done
   if [[ \$ok -eq 0 ]]; then
-    echo "ERROR: nvidia-imex did not reach 'active' state on \$(hostname)" >&2
+    echo "ERROR: nvidia-imex did not reach 'active' state on \$NODE_LABEL" >&2
     echo "       Check: systemctl status nvidia-imex ; journalctl -u nvidia-imex -n 50" >&2
     exit 1
   fi
 fi
 
 if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
-  echo "  [\$(hostname)] channel0 missing (lost on last reboot, as expected) -- recreating..."
+  echo "  [\$NODE_LABEL] channel0 missing (lost on last reboot, as expected) -- recreating..."
   MAJOR=""
   for attempt in \$(seq 1 ${IMEX_WAIT_ATTEMPTS}); do
     MAJOR=\$(cat /proc/devices | grep nvidia-caps-imex-channels | awk '{print \$1}')
@@ -569,7 +580,7 @@ if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
     sleep ${IMEX_WAIT_SLEEP}
   done
   if [[ -z "\$MAJOR" ]]; then
-    echo "ERROR: nvidia-caps-imex-channels major number never appeared in /proc/devices on \$(hostname)" >&2
+    echo "ERROR: nvidia-caps-imex-channels major number never appeared in /proc/devices on \$NODE_LABEL" >&2
     exit 1
   fi
   mkdir -p /dev/nvidia-caps-imex-channels
@@ -577,7 +588,7 @@ if [[ ! -e /dev/nvidia-caps-imex-channels/channel0 ]]; then
   mknod /dev/nvidia-caps-imex-channels/channel0 c "\$MAJOR" 0
   chmod 0666 /dev/nvidia-caps-imex-channels/channel0
 fi
-test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still missing on \$(hostname)" >&2; exit 1; }
+test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still missing on \$NODE_LABEL" >&2; exit 1; }
 
 # A previous run that got aborted (Ctrl-C, a bad rank, a node fault) can
 # leave a stale all_reduce_perf/alltoall_perf/orted/mpirun process still
@@ -593,13 +604,13 @@ test -e /dev/nvidia-caps-imex-channels/channel0 || { echo "ERROR: channel0 still
 STALE_PIDS=\$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \\
   | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun' | awk -F',' '{print \$1}')
 if [[ -n "\$STALE_PIDS" ]]; then
-  echo "  [\$(hostname)] stale test process(es) still attached to GPU -- killing: \$STALE_PIDS"
+  echo "  [\$NODE_LABEL] stale test process(es) still attached to GPU -- killing: \$STALE_PIDS"
   kill -9 \$STALE_PIDS 2>/dev/null || true
   sleep 2
   STILL=\$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \\
     | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun')
   if [[ -n "\$STILL" ]]; then
-    echo "ERROR: stale process(es) on \$(hostname) survived kill -9:" >&2
+    echo "ERROR: stale process(es) on \$NODE_LABEL survived kill -9:" >&2
     echo "\$STILL" >&2
     echo "       Check for a wedged GPU (dmesg | grep -i xid) rather than retrying blindly." >&2
     exit 1
@@ -622,16 +633,16 @@ grep -qxF 'pcompress_base_silence_warning = 1' /root/.pmix/mca-params.conf 2>/de
 # so this should normally be a no-op. Re-extracts from the LOCAL cached
 # tar.gz (no network needed) only if it's genuinely gone.
 if [[ ! -f "\$PACK_DIR/bin/all_reduce_perf" || ! -f "\$PACK_DIR/bin/alltoall_perf" || ! -f "\$PACK_DIR/bin/mpirun" || ! -f "\$PACK_DIR/bin/orted" ]]; then
-  echo "  [\$(hostname)] nccl-test-pack missing/incomplete -- re-extracting from local cache..."
+  echo "  [\$NODE_LABEL] nccl-test-pack missing/incomplete -- re-extracting from local cache..."
   if [[ ! -f "\$PACK_CACHE" ]]; then
-    echo "ERROR: cached pack not found at \$PACK_CACHE on \$(hostname) -- redeploy needed" >&2
+    echo "ERROR: cached pack not found at \$PACK_CACHE on \$NODE_LABEL -- redeploy needed" >&2
     exit 1
   fi
   mkdir -p "\$PACK_DIR"
   tar xzf "\$PACK_CACHE" -C "\$PACK_DIR"
 fi
 
-echo "  [\$(hostname)] nvidia-imex active, channel0 OK, no stale GPU processes, PMIx compress-warning silenced, pack OK"
+echo "  [\$NODE_LABEL] nvidia-imex active, channel0 OK, no stale GPU processes, PMIx compress-warning silenced, pack OK"
 REMOTE
 done
 echo "=== Pre-flight complete ==="

@@ -64,8 +64,21 @@ done
 if [[ $PREFLIGHT -eq 1 ]]; then
   grep -qxF "$PREFLIGHT_END" "$RUN_NCCL" || { echo "ERROR: no '$PREFLIGHT_END' line in $RUN_NCCL --" >&2
     echo "       re-stage it with deploy_rack_nccl_test.sh, or run without --preflight" >&2; exit 1; }
-  echo "=== Running run_nccl_test.sh pre-flight only (no nccl-tests sweep) ==="
-  bash <(sed "\\|^${PREFLIGHT_END}\$|q" "$RUN_NCCL") ${NODES_REQUESTED:+"$NODES_REQUESTED"} \
+  echo "=== --preflight: running run_nccl_test.sh's pre-flight (its All-Reduce/All-to-All sweep is skipped), then the GPU ranking ==="
+  # An older staged run_nccl_test.sh labels its pre-flight lines [$(hostname)],
+  # which is the same on every node of some racks. Relabel those lines nNN/IP
+  # (position in the IMEX node list it has just written + IP), as deploy
+  # v0.24+ already does, so a re-stage is not needed. A v0.24+ file (it sets
+  # NODE_LABEL itself) is left exactly as it is.
+  RELABEL=()
+  if ! grep -q '^NODE_LABEL=' "$RUN_NCCL"; then
+    RELABEL=(-e "/<<'REMOTE'\$/,/^REMOTE\$/{
+                   /^set -e\$/a\\
+NODE_LABEL=\$(awk -v me=\" \$(hostname -I 2>/dev/null) \" 'NF { if (index(me, \" \" \$1 \" \")) { printf \"n%02d/%s\", n, \$1; exit } n++ }' $IMEX_CFG 2>/dev/null || true); NODE_LABEL=\${NODE_LABEL:-\$(hostname)}
+                   s/\\\$(hostname)/\$NODE_LABEL/g
+                 }")
+  fi
+  bash <(sed -e "\\|^${PREFLIGHT_END}\$|q" "${RELABEL[@]}" "$RUN_NCCL") ${NODES_REQUESTED:+"$NODES_REQUESTED"} \
     || { echo "ERROR: pre-flight from $RUN_NCCL failed (see above)" >&2; exit 1; }
 fi
 
@@ -96,11 +109,13 @@ fi
 SUM=$(md5sum "$BIN" | cut -d' ' -f1)
 echo "=== Checking ${#NODES[@]} node(s): binary, nvidia-imex, channel0, stale GPU processes ==="
 declare -A PIDS
-for ip in "${NODES[@]}"; do
+for i in "${!NODES[@]}"; do
+  ip="${NODES[$i]}"
+  label=$(printf 'n%02d/%s' "$i" "$ip")   # same nNN/IP form as the ranking table
   (
     remote=$(ssh -o BatchMode=yes $SSH_OPTS "root@${ip}" "md5sum '$BIN' 2>/dev/null | cut -d' ' -f1")
     if [[ "$remote" != "$SUM" ]]; then
-      scp -q $SSH_OPTS "$BIN" "root@${ip}:$BIN" || { echo "  [$ip] copy FAILED"; exit 1; }
+      scp -q $SSH_OPTS "$BIN" "root@${ip}:$BIN" || { echo "  [$label] copy FAILED"; exit 1; }
     fi
     msg=$(ssh -o BatchMode=yes $SSH_OPTS "root@${ip}" bash -s 2>&1 <<'REMOTE'
 systemctl is-active --quiet nvidia-imex || { echo "nvidia-imex not active"; exit 1; }
@@ -108,7 +123,7 @@ systemctl is-active --quiet nvidia-imex || { echo "nvidia-imex not active"; exit
 STALE=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -E 'all_reduce_perf|alltoall_perf|nccl_pairwise_rank|orted|mpirun')
 [[ -z "$STALE" ]] || { echo "stale GPU process: $STALE"; exit 1; }
 REMOTE
-    ) || { echo "  [$ip] NOT READY: ${msg:-ssh failed}"; exit 1; }
+    ) || { echo "  [$label] NOT READY: ${msg:-ssh failed}"; exit 1; }
   ) &
   PIDS["$ip"]=$!
 done

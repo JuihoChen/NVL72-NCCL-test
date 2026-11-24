@@ -35,6 +35,10 @@ first. It runs only the pre-flight part of the staged `run_nccl_test.sh`
 cleanup, pack check), cut out of that file up to its
 `=== Pre-flight complete ===` line, and skips the All-Reduce / All-to-All
 sweep. Without `--preflight` the script only checks node state, as before.
+It then goes straight on to the GPU ranking in the same run. Pre-flight
+lines are labelled `nNN/IP` (e.g. `[n07/192.168.41.147]`, n00 = node-00),
+the same form as the ranking table, since every node of a rack can share
+one hostname.
 
 Output goes to the screen and to `run/results/<timestamp>_<N>node_gpu_rank.log`,
 with the full pair matrix in `..._gpu_rank_matrix.csv`. Options pass through
