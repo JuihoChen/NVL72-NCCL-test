@@ -1,97 +1,114 @@
 # VR200: NCCL tests across compute trays
 
-Two scripts, the VR200 counterparts of the GB300 flow:
+The GB300 flow, on VR200: build a portable test pack once, push it to every
+tray from the jumper, run from node-00. The GB300 files at the top of the
+repo are untouched; everything VR200 lives in this folder.
 
 | | GB300 | VR200 |
 |---|---|---|
+| Pack build | `nccl_arm64.Dockerfile` (in `../GB300_mpirun_NCCL_diag_deployment.md`) | `pack/build_vr_pack.sh` + `pack/nccl_vr_arm64.Dockerfile` |
+| Pack | `nccl-test-pack-arm64.tar.gz` | `nccl-test-pack-vr-arm64.tar.gz` |
 | Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
-| Test, on node-00 / tray 1 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
-| NCCL | pack's own `lib/` | system `libnccl2`, stock release (2.32.6+cuda13.5) |
-| MPI | pack's Open MPI 4 (`orted`) | Ubuntu Open MPI 5 (`prterun`) |
-| nccl-tests | pack's `bin/` | stock source, built once on tray 1 with `MPI=1`, copied to every tray |
-| User | root | root, or a normal user with `--user` (repairs then use `sudo -n`) |
+| Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
+| Open MPI | 4.1.6 `--without-slurm`, in the pack | same |
+| NCCL | 2.28.7 (built from tag), in the pack | stock `libnccl2 2.32.6-1+cuda13.5` release package, in the pack |
+| CUDA runtime | 13.0, in the pack | 13.5, in the pack |
+| nccl-tests | v2.17.8, in the pack | same tag (overridable) |
+| Default data dir | `/root/portable-nccl` | same |
 
-Nothing on the trays is patched: no test pack, no `LD_LIBRARY_PATH`
-overrides, no rebuilt NCCL. The NCCL settings match the rack script
-(MNNVL auto, NVLS on, IB off).
+Only the GPU driver and IMEX come from the trays. Nothing on the trays is
+patched or installed, and the NCCL is NVIDIA's release build as is. The
+NCCL settings and mpirun flags match GB300 (`--mca schizo ompi`, ob1/tcp,
+MNNVL auto, NVLS on, IB off, `NCCL_P2P_SCHEDULE_GROUP_SIZE=1`).
 
-## Target stack (VR NVL72 1.0.0 RC)
+Identical hostnames on all trays are fine again: they only hung the system
+Open MPI 5 used during bring-up (finding 3), not the pack's Open MPI 4.
+Pre-flight lines are labelled `nNN/IP` like GB300.
 
-The pre-flight checks each tray against these defaults. Matching is by
-substring, and each one can be overridden in the environment (on the
-jumper, it is then written to `vr_nccl.conf`; set it to `""` to skip it).
-
-| Component | Variable | Default | Mismatch |
-|---|---|---|---|
-| Driver (user space and kernel module) | `EXPECT_DRIVER` | `620.70.08` | FAIL |
-| CUDA (`$CUDA_HOME/version.json`) | `EXPECT_CUDA` | `13.5.0` | FAIL |
-| `libnccl2` | `EXPECT_NCCL` + `EXPECT_NCCL_CUDA` | `2.32.6` + `cuda13.5` | FAIL |
-| IMEX (`nvidia-imex*` package / `--version`) | `EXPECT_IMEX` | `2.0.0` | FAIL on multi-tray runs |
-| NVSHMEM (`nvshmem*` package) | `EXPECT_NVSHMEM` | `3.8.0` | WARN (not used by nccl-tests) |
-| DOCA Host (`doca-host` package) | `EXPECT_DOCA` | `3.3.3` | WARN (not used by nccl-tests) |
-
-`--versions-warn` (on either script) turns the FAIL mismatches into
-warnings, for trying a newer drop. All trays must still match each other
-(driver, CUDA, NCCL, IMEX).
-
-## Deploy (from the jumper)
+## 1. Build the pack (once, any Docker host)
 
 ```bash
-./deploy_vr_nccl_test.sh --hosts 192.168.101.136,192.168.101.137   # tray 1 first
-./deploy_vr_nccl_test.sh rackNN.sh                  # or CM_IPS from a GB300-style rack file
-./deploy_vr_nccl_test.sh rackNN.sh --set-hostnames vr200   # cloned image: rename to vr200-nNN
-./deploy_vr_nccl_test.sh rackNN.sh --nccl-tests-src nccl-tests.tar.gz   # trays without internet
-./deploy_vr_nccl_test.sh rackNN.sh --user nvidia    # SSH and run as nvidia instead of root
-./deploy_vr_nccl_test.sh rackNN.sh --auto -- 1      # deploy, then run the test on 1 tray
-./deploy_vr_nccl_test.sh rackNN.sh --dry-run        # print what would be done
+cd vr200/pack
+./build_vr_pack.sh                         # -> vr200/nccl-test-pack-vr-arm64.tar.gz
+./build_vr_pack.sh --nccl-debs ~/vr-drop/  # NCCL .debs from the release drop instead of apt
 ```
 
-Tray 1 (first in `--hosts`, or the LAST entry of `CM_IPS`, the same
-reversal as the GB300 script) is the launch node. Steps:
+On an aarch64 host it builds natively. On x86 it needs `docker buildx` with
+arm64 emulation (qemu/binfmt), like the GB300 pack. Steps, in
+`nccl_vr_arm64.Dockerfile`:
 
-0. Passwordless SSH jumper -> every tray (`--bootstrap [password]` seeds
-   the jumper's key with `sshpass` first). Stale `known_hosts` entries are
-   cleared, so a swapped tray on a reused IP is fine.
-1. SSH mesh tray 1 -> every tray, itself included, verified from tray 1
-   (mpirun and the pre-flight use it; a missing link would hang mpirun).
-2. Hostnames must be unique: identical hostnames hang Open MPI 5 (finding 3
-   below). `--set-hostnames <prefix>` sets `<prefix>-n00`, `-n01`, ... in
-   tray order and writes a marked `# vr-nccl` block with all trays into
-   `/etc/hosts`.
-3. nccl-tests: the stock source (cloned on tray 1 from
-   `NCCL_TESTS_REPO`, optionally at `NCCL_TESTS_REF`, or pushed with
-   `--nccl-tests-src <dir|tar.gz>`) is built once on tray 1 with
-   `make MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/cuda`
-   against the system NCCL (`libnccl-dev` must match `libnccl2`), then
-   `build/` is copied to the same path on every tray. A stamp
-   (NCCL / nvcc / Open MPI versions + source checksum) skips the build and
-   the copies when nothing changed, so after a stack upgrade a re-deploy
-   rebuilds by itself. `--rebuild` forces it; `NVCC_GENCODE` is passed to
-   make when set.
-4. `run_vr_nccl_test.sh` and `vr_nccl.conf` (host list, paths, optional
-   `--uuid` and pinned versions) are staged on tray 1.
-5. `run_vr_nccl_test.sh --check` runs the full pre-flight on tray 1. The
+1. Base image `nvcr.io/nvidia/cuda:13.5.0-devel-ubuntu24.04` (`CUDA_IMAGE`).
+2. Open MPI 4.1.6, configured like GB300 (`--without-slurm --with-ucx
+   --disable-mpi-fortran`, distro PMIx), installed straight into
+   `/opt/pack`.
+3. NCCL: `libnccl2` / `libnccl-dev` `2.32.6-1+cuda13.5`
+   (`NCCL_DEB_VERSION`) from the CUDA apt repo, or the `.deb` files given
+   with `--nccl-debs`. The build fails unless exactly that version, and one
+   `libnccl.so.2`, is left (a CUDA image's own libnccl cannot be picked up
+   by mistake, the GB300 "delete pre-bundled libnccl" lesson).
+4. nccl-tests `v2.17.8` (`NCCL_TESTS_REF`) with `MPI=1` against both.
+5. `assemble_pack.sh` copies `libnccl.so.2`, `libcudart.so.13` and every
+   other library the binaries and Open MPI plugins need into `lib/`, except
+   the base-OS floor the GB300 audit found (glibc, `libstdc++`, `libgcc_s`,
+   `libz`, `libudev`) and the driver (`libcuda`, `libnvidia-*`). It fails if
+   anything else is unresolved, or if a test binary would load a non-pack
+   NCCL. It writes `PACK_INFO` (versions, checked by the pre-flight) and
+   `PACK_LIBS` (the `ldd` audit).
+
+Pack layout (same as GB300, plus the two info files):
+
+```
+bin/      *_perf (nccl-tests), mpirun, orterun, orted, ompi_info, ...
+lib/      libmpi.so.40, libopen-rte/-pal, libpmix, libhwloc, libevent*, libucx*,
+          libnccl.so.2 (2.32.6), libcudart.so.13, lib/openmpi/ (MCA plugins)
+share/    openmpi help files, wrapper data
+PACK_INFO nccl=2.32.6-1+cuda13.5, cuda=13.5.0, openmpi=4.1.6, nccl_tests=v2.17.8, ...
+PACK_LIBS ldd of all_reduce_perf against the pack
+```
+
+## 2. Deploy (from the jumper)
+
+```bash
+cd vr200
+./deploy_vr_nccl_test.sh rackNN.sh                  # CM_IPS from a GB300-style rack file
+./deploy_vr_nccl_test.sh --hosts 192.168.101.136,192.168.101.137   # or a list, node-00 first
+./deploy_vr_nccl_test.sh rackNN.sh my-pack.tar.gz   # default ./nccl-test-pack-vr-arm64.tar.gz
+./deploy_vr_nccl_test.sh rackNN.sh --only <ip>      # re-push to a swapped tray only
+./deploy_vr_nccl_test.sh rackNN.sh --bootstrap [password]
+./deploy_vr_nccl_test.sh rackNN.sh --auto [-- 1 --info]   # deploy, then run the test
+./deploy_vr_nccl_test.sh rackNN.sh --dry-run
+```
+
+node-00 is the LAST entry of `CM_IPS` (same reversal as GB300) or the first
+of `--hosts`. `NCCL_MNNVL_UUID` is derived from the rack file name like GB300
+(`rack17.sh` -> `0x17`, `--uuid` overrides; unset with `--hosts`, so NCCL
+picks it). Steps:
+
+0. Passwordless SSH jumper -> every tray (`--bootstrap` seeds the key with
+   `sshpass`). Stale `known_hosts` entries are cleared (tray swap).
+1. The pack is pushed to every tray **in parallel** and extracted under
+   `--data-dir`. A tray whose cached tar.gz has the same sha256 is not
+   copied again (GB300 compares sizes). The old `bin/ lib/ share/` are
+   replaced, so no library of an older pack is left behind.
+2. SSH mesh node-00 -> every tray, itself included, verified from node-00.
+3. `run_vr_nccl_test.sh` and `vr_nccl.conf` (hosts, pack paths, UUID,
+   pinned versions) are staged in `<data-dir>/run/` on node-00.
+4. `run_vr_nccl_test.sh --check` runs the full pre-flight on node-00; the
    deploy exits non-zero if it fails (`--no-check` skips it).
 
-Layout on the trays (`--data-dir`, default `<user's home>/vr-nccl`):
+`--user <name>` runs everything as a normal user instead of root (data dir
+`~/portable-nccl`, repairs through `sudo -n`).
 
-```
-vr-nccl/nccl-tests/            source + build/ (every tray, same path)
-vr-nccl/run/run_vr_nccl_test.sh
-vr-nccl/run/vr_nccl.conf
-vr-nccl/run/results/           logs + hostfiles (tray 1)
-```
+A reboot needs no re-deploy: the test repairs IMEX / channel0, clears stale
+processes and re-extracts the pack from its local cache if it is damaged,
+every run. Re-deploy after a tray swap, a reimage or a new pack.
 
-A reboot needs no re-deploy: the test repairs IMEX / channel0 and clears
-stale processes every time. Re-deploy after a tray swap, a reimage or a
-stack upgrade.
-
-## Test (on tray 1)
+## 3. Test (on node-00)
 
 ```bash
-cd ~/vr-nccl/run
+cd /root/portable-nccl/run
 bash run_vr_nccl_test.sh --check        # pre-flight only, prints the mpirun lines
-bash run_vr_nccl_test.sh 1              # first tray only (4 GPUs)
+bash run_vr_nccl_test.sh 1              # node-00 only (4 GPUs)
 bash run_vr_nccl_test.sh                # all trays
 bash run_vr_nccl_test.sh --info         # NCCL INFO -> /tmp/nccl_info/ on each tray
 bash run_vr_nccl_test.sh --no-nvls      # skip NVLink-switch multicast (NVLS)
@@ -99,23 +116,37 @@ bash run_vr_nccl_test.sh --no-mnnvl     # control run: no NVLink between trays (
 bash run_vr_nccl_test.sh --max-size 8G
 ```
 
-Settings come from built-in defaults < `vr_nccl.conf` < environment <
-command line. Without a conf (the bring-up way) pass `--hosts ip1,ip2`
-and the script looks for nccl-tests in `$NCCL_TESTS_DIR`, `~/nccl-tests`,
-then `/home/nvidia/nccl-tests`; logs then go to `~/nccl-results/`.
+Settings: built-in defaults < `vr_nccl.conf` < environment < command line.
+Logs and hostfiles go to `<data-dir>/run/results/`.
+
+### Target versions
+
+Matching is by substring. Each can be overridden in the environment (on the
+jumper it is then written to `vr_nccl.conf`); `""` skips that check.
+`--versions-warn` (either script) turns FAIL into WARN, to try a newer drop.
+All trays must also agree with each other on driver, IMEX and pack.
+
+| Component | Where | Variable | Default | Mismatch |
+|---|---|---|---|---|
+| Driver, user space = kernel module | tray | `EXPECT_DRIVER` | `620.70.08` | FAIL |
+| IMEX (`nvidia-imex*` package / `--version`) | tray | `EXPECT_IMEX` | `2.0.0` | FAIL on multi-tray runs |
+| NCCL | pack `PACK_INFO` | `EXPECT_NCCL` + `EXPECT_NCCL_CUDA` | `2.32.6` + `cuda13.5` | FAIL |
+| CUDA runtime | pack `PACK_INFO` | `EXPECT_CUDA` | `13.5.0` | FAIL |
+| NVSHMEM (`nvshmem*` package) | tray | `EXPECT_NVSHMEM` | `3.8.0` | WARN |
+| DOCA Host (`doca-host` package) | tray | `EXPECT_DOCA` | `3.3.3` | WARN |
 
 ### Pre-flight checks (per tray, over SSH)
 
-- stack versions (table above); driver user space **and** kernel module
-  must agree (finding 1)
-- `nvidia-smi` works, 4 GPUs visible
-- nccl-tests built with MPI and linked to the system `libnccl.so.2`
+- versions (table above); driver user space **and** kernel module must
+  agree (finding 1); `nvidia-smi` works, 4 GPUs visible
+- pack complete (else re-extracted from the cache); `*_perf`, `mpirun`,
+  `orted` resolve every library, and NCCL / MPI come from the pack
 - bootstrap interface: each tray reports its own (names differ per tray, e.g. `enx<MAC>`)
 - multi-tray runs: IMEX node list, `nvidia-imex` active, IMEX channel0, fabric `State`
 - fabric **health**: `Summary: Healthy`, `Route Unhealthy: False`
 - `nvidia-smi topo -p2p r` is `OK` for every GPU pair
-- stale test processes cleared
-- across trays: same driver, CUDA, NCCL and IMEX, same `ClusterUUID`, **unique hostnames**
+- stale test processes (`*_perf`, `orted`, `mpirun`) cleared
+- across trays: same driver, IMEX and pack (sha256), same `ClusterUUID`
 
 ## Findings from the first two trays (bring-up, Nov 2026)
 
@@ -168,7 +199,8 @@ These were seen on the earlier dev stack (driver 620.62, NCCL 2.32.4gr100).
    on the default partition.
 3. **Identical hostnames hang Open MPI 5** before NCCL starts (cloned OS image ->
    every tray is `localhost`). Open MPI 4 / HPC-X (rack pack, NGC containers)
-   does not have this problem. Fix here: unique hostnames.
+   does not have this problem. Fix then: unique hostnames. Since the switch
+   to the pack's Open MPI 4.1.6 this no longer matters.
 4. **Cross-tray memory import refused: NVLink `bwMode` mismatch.** Across trays
    NCCL failed at the first transfer: `ncclP2pImportShareableBuffer` CUDA 401/400
    (`--no-nvls`), and with NVLS `ncclMcGroupBuildPartitions` CUDA 999. IMEX logged

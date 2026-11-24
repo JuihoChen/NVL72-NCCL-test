@@ -1,68 +1,62 @@
 #!/bin/bash
-# run_vr_nccl_test.sh -- multi-tray NCCL test for VR200 compute trays, launched from tray 1
+# run_vr_nccl_test.sh -- multi-tray NCCL test for VR200 compute trays, launched from node-00
 #
-# Normally staged by ../deploy_vr_nccl_test.sh (run from the jumper), which
-# writes vr_nccl.conf next to this script with the host list and paths.
-# It also works on its own with --hosts (the bring-up way).
+# Staged on node-00 (tray 1) by ../deploy_vr_nccl_test.sh, which also writes
+# vr_nccl.conf next to it (host list, pack location, UUID). The VR200
+# counterpart of the run_nccl_test.sh that deploy_rack_nccl_test.sh generates
+# for GB300, and the same model:
+#   - every tray runs the test PACK (nccl-test-pack-vr-arm64.tar.gz, built by
+#     pack/build_vr_pack.sh) extracted under PACK_DIR: its own *_perf
+#     binaries, its own Open MPI 4.1.6 (--without-slurm; mpirun/orted, with
+#     OPAL_PREFIX=PACK_DIR) and its own stock NCCL 2.32.6 + CUDA 13.5 runtime.
+#     Only the GPU driver and IMEX come from the tray.
+#   - root (like GB300) or a normal user with passwordless SSH to every tray,
+#     itself included; repairs then go through "sudo -n"
+#   - same NCCL settings as GB300 (MNNVL auto, NVLS on, IB off)
 #
-# Derived from deploy_rack_nccl_test.sh (its run_nccl_test.sh part), adapted
-# to how VR200 trays are set up:
-#   - no test pack: every tray uses its SYSTEM-installed, stock release stack
-#     (driver 620.70.08, CUDA 13.5, libnccl2 2.32.6+cuda13.5, IMEX 2.0.0),
-#     and stock nccl-tests built with MPI=1 at the SAME path on every tray
-#   - launcher is the system Open MPI 5 (prterun) -- not a custom pack mpirun
-#   - runs as root (like the rack script) or as a normal user (e.g. nvidia).
-#     Either way it needs passwordless SSH AS THAT USER to every tray, itself
-#     included. As root, --allow-run-as-root is added and the IMEX/channel0
-#     repairs run directly; as a normal user they go through "sudo -n".
-#   - same NCCL settings as the rack script (MNNVL auto, NVLS on, IB off)
-#
-# Run it ON TRAY 1 (the first host in the list):
-#   bash run_vr_nccl_test.sh                 # all hosts
-#   bash run_vr_nccl_test.sh 1               # first tray only (4 GPUs, smoke test)
+# Run it ON NODE-00 (the first host in the list):
+#   bash run_vr_nccl_test.sh                 # all trays
+#   bash run_vr_nccl_test.sh 1               # node-00 only (4 GPUs, smoke test)
 #   bash run_vr_nccl_test.sh --info          # NCCL INFO -> /tmp/nccl_info/ on each tray
-#   bash run_vr_nccl_test.sh --dry-run       # pre-flight only (no repairs), print mpirun
+#   bash run_vr_nccl_test.sh --check         # pre-flight only (no repairs), print mpirun
 #   bash run_vr_nccl_test.sh --max-size 8G   # shorter sweep (default 32G)
 #   bash run_vr_nccl_test.sh --hosts 10.0.0.1,10.0.0.2
 #   bash run_vr_nccl_test.sh --versions-warn # version mismatches are warnings, not failures
 #   bash run_vr_nccl_test.sh --require-mnnvl # fail instead of silently falling back
 #                                            # if multi-node NVLink is unavailable
 #   bash run_vr_nccl_test.sh --allow-ib      # let NCCL use IB/RoCE between trays
-#   bash run_vr_nccl_test.sh --uuid 0x01     # set NCCL_MNNVL_UUID (normally not needed)
+#   bash run_vr_nccl_test.sh --uuid 0x01     # set NCCL_MNNVL_UUID
 #   bash run_vr_nccl_test.sh --no-nvls       # NCCL_NVLS_ENABLE=0: skip NVLink-switch multicast
 #                                            # (isolates multicast problems from plain MNNVL)
 #   bash run_vr_nccl_test.sh --no-mnnvl      # NCCL_MNNVL_ENABLE=0 (+ no NVLS): control run that
 #                                            # avoids NVLink between trays (TCP, slow) to prove
 #                                            # MPI/NCCL/tests are fine apart from the fabric
-#                                            # (default max size then 64M: TCP over the
-#                                            # bootstrap NIC is ~0.1 GB/s)
+#                                            # (default max size then 64M)
 #
 # Settings, lowest to highest priority: built-in defaults < vr_nccl.conf <
 # environment < command line. Environment / conf variables:
-#   HOSTS          comma-separated tray IPs, tray 1 first (or use --hosts)
-#   NCCL_TESTS_DIR (default ~/nccl-tests, then /home/nvidia/nccl-tests)
-#   RESULTS_DIR    (default ~/nccl-results)       CUDA_HOME (default /usr/local/cuda)
+#   HOSTS        comma-separated tray IPs, node-00 first (or use --hosts)
+#   PACK_DIR     extracted pack (default /root/portable-nccl, or ~/portable-nccl)
+#   PACK_CACHE   the pack's tar.gz, re-extracted from if PACK_DIR is damaged
+#   RESULTS_DIR  (default PACK_DIR/run/results)
 #   Expected versions (substring match; set one to "" to skip that check):
-#   EXPECT_DRIVER  620.70.08    EXPECT_CUDA 13.5.0    EXPECT_NCCL 2.32.6
-#   EXPECT_NCCL_CUDA cuda13.5   EXPECT_IMEX 2.0.0     (must match: [FAIL])
-#   EXPECT_NVSHMEM 3.8.0        EXPECT_DOCA 3.3.3     (informational: [WARN])
+#   EXPECT_DRIVER 620.70.08 (tray)   EXPECT_IMEX 2.0.0 (tray)      -> [FAIL]
+#   EXPECT_NCCL 2.32.6 + EXPECT_NCCL_CUDA cuda13.5, EXPECT_CUDA 13.5.0
+#                (the pack's PACK_INFO)                             -> [FAIL]
+#   EXPECT_NVSHMEM 3.8.0, EXPECT_DOCA 3.3.3 (tray, informational)  -> [WARN]
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.8-vr"
+SCRIPT_VERSION="0.9-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${VR_NCCL_CONF:-$SCRIPT_DIR/vr_nccl.conf}"
 # The conf only fills variables the environment has not set ("${X:-...}")
 # shellcheck source=/dev/null
 [[ -f "$CONF" ]] && source "$CONF"
-if [[ -z "${NCCL_TESTS_DIR:-}" ]]; then
-  for d in "$HOME/nccl-tests" /home/nvidia/nccl-tests; do
-    [[ -x "$d/build/all_reduce_perf" ]] && { NCCL_TESTS_DIR="$d"; break; }
-  done
-  NCCL_TESTS_DIR="${NCCL_TESTS_DIR:-$HOME/nccl-tests}"
-fi
-RESULTS_DIR="${RESULTS_DIR:-$HOME/nccl-results}"
+PACK_DIR="${PACK_DIR:-$([[ $EUID -eq 0 ]] && echo /root/portable-nccl || echo "$HOME/portable-nccl")}"
+PACK_CACHE="${PACK_CACHE:-$PACK_DIR/nccl-test-pack-vr-arm64.tar.gz}"
+RESULTS_DIR="${RESULTS_DIR:-$PACK_DIR/run/results}"
 # Target: VR NVL72 1.0.0 RC compute tray stack. ${X-default} (no colon) so
 # that EXPECT_X="" really means "skip this check".
 EXPECT_DRIVER="${EXPECT_DRIVER-620.70.08}"
@@ -72,7 +66,6 @@ EXPECT_NCCL_CUDA="${EXPECT_NCCL_CUDA-cuda13.5}"
 EXPECT_IMEX="${EXPECT_IMEX-2.0.0}"
 EXPECT_NVSHMEM="${EXPECT_NVSHMEM-3.8.0}"
 EXPECT_DOCA="${EXPECT_DOCA-3.3.3}"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
 
@@ -87,7 +80,7 @@ NVLS_ENABLE=1
 MNNVL_UUID="${MNNVL_UUID:-}"
 NODES_REQUESTED=""
 
-usage() { sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -139,10 +132,10 @@ ROOT_FLAG=()
 if [[ $EUID -eq 0 ]]; then
   echo "Running as root: adding --allow-run-as-root"
   ROOT_FLAG=(--allow-run-as-root)
-  # also honoured by the remote prted daemons / ranks
+  # also honoured by the remote orted daemons / ranks
   export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 fi
-echo "nccl-tests: ${NCCL_TESTS_DIR} | results: ${RESULTS_DIR}"
+echo "pack: ${PACK_DIR} | results: ${RESULTS_DIR}"
 
 # --- 1. SSH: mpirun reaches every node (itself included) over SSH ---------
 echo "=== Checking passwordless SSH to ${#RUN_NODES[@]} node(s) ==="
@@ -162,14 +155,16 @@ echo "    OK"
 
 # --- 2. Per-node pre-flight (runs ON each node over SSH) -------------------
 # Prints its checks, then one machine-readable line:
-#   PREFLIGHT|<rc>|<driver>|<nccl>|<fabric>|<cluster>|<if>|<cidr>|<hostname>|<cuda>|<imex>
+#   PREFLIGHT|<rc>|<driver>|<pack nccl>|<fabric>|<cluster>|<if>|<cidr>|<pack sha>|<pack cuda>|<imex>
 read -r -d '' REMOTE_PREFLIGHT <<'REMOTE' || true
 set -uo pipefail
-EXPECT_DRIVER="$1"; EXPECT_NCCL="$2"; TESTS_DIR="$3"; CUDA_HOME="$4"
+EXPECT_DRIVER="$1"; EXPECT_NCCL="$2"; PACK_DIR="$3"; PACK_CACHE="$4"
 IMEX_CFG="$5"; HOSTLIST="$6"; DRY_RUN="$7"; INFO="$8"; MULTI="$9"; MYIP="${10}"
 EXPECT_CUDA="${11}"; EXPECT_NCCL_CUDA="${12}"; EXPECT_IMEX="${13}"
 EXPECT_NVSHMEM="${14}"; EXPECT_DOCA="${15}"; VWARN="${16}"
-TAG="[$(hostname)/$(hostname -I | awk '{print $1}')]"
+# Label nNN/IP (position in the host list, n00 = node-00), like GB300 v0.24:
+# trays may share one hostname, which is fine with the pack's Open MPI 4
+TAG="[$(echo "$HOSTLIST" | tr ',' '\n' | awk -v me="$MYIP" '$1==me {printf "n%02d/%s", NR-1, me; f=1} END{if(!f) printf "%s", me}')]"
 RC=0
 ok()   { echo "  $TAG [OK]   $*"; }
 warn() { echo "  $TAG [WARN] $*"; }
@@ -196,20 +191,24 @@ else
   bad "nvidia-smi failed: $(echo "$OUT" | head -1)  (check: journalctl -k -b | grep NVRM)"
 fi
 
-# CUDA toolkit (the runtime nccl-tests links against)
-CUDA=$(sed -n '/"cuda"/,/}/{s/.*"version" *: *"\([^"]*\)".*/\1/p}' "$CUDA_HOME/version.json" 2>/dev/null | head -1)
-[[ -n "$CUDA" ]] || CUDA=$("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep -oE 'V[0-9][0-9.]*' | tr -d V | head -1)
-CUDA="${CUDA:-none}"
-if [[ -z "$EXPECT_CUDA" || "$CUDA" == "$EXPECT_CUDA"* ]]; then ok "CUDA $CUDA ($CUDA_HOME)"
-else vbad "CUDA at $CUDA_HOME is '$CUDA', expected $EXPECT_CUDA"; fi
-
-# NCCL package: the stock release build for this CUDA (e.g. 2.32.6-1+cuda13.5),
-# not a dev drop
-NCCL=$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null || echo "none")
-NCCL="${NCCL:-none}"
+# The pack: present (re-extracted from the local cache if not, like GB300),
+# and its PACK_INFO says what NCCL / CUDA runtime / Open MPI it carries
+if [[ ! -x "$PACK_DIR/bin/mpirun" || ! -x "$PACK_DIR/bin/orted" || ! -x "$PACK_DIR/bin/all_reduce_perf" \
+      || ! -x "$PACK_DIR/bin/alltoall_perf" || ! -f "$PACK_DIR/PACK_INFO" ]]; then
+  if [[ "$DRY_RUN" -eq 1 ]]; then warn "pack missing/incomplete in $PACK_DIR (would re-extract $PACK_CACHE)"
+  elif [[ -f "$PACK_CACHE" ]] && (cd "$PACK_DIR" && rm -rf bin lib share PACK_INFO PACK_LIBS && tar xzf "$PACK_CACHE"); then
+    ok "pack was incomplete -- re-extracted from $PACK_CACHE"
+  else bad "pack missing in $PACK_DIR and no usable cache at $PACK_CACHE -- re-run deploy_vr_nccl_test.sh"; fi
+fi
+pinfo() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$PACK_DIR/PACK_INFO" 2>/dev/null; }
+NCCL=$(pinfo nccl); NCCL="${NCCL:-none}"
+CUDA=$(pinfo cuda); CUDA="${CUDA:-none}"
+PSHA=$(sha256sum "$PACK_CACHE" 2>/dev/null | cut -c1-12); PSHA="${PSHA:-none}"
 if [[ ( -z "$EXPECT_NCCL" || "$NCCL" == *"$EXPECT_NCCL"* ) && ( -z "$EXPECT_NCCL_CUDA" || "$NCCL" == *"$EXPECT_NCCL_CUDA"* ) ]]; then
-  ok "libnccl2 $NCCL"
-else vbad "libnccl2 is '$NCCL', expected $EXPECT_NCCL (+$EXPECT_NCCL_CUDA)"; fi
+  ok "pack NCCL $NCCL"
+else vbad "pack NCCL is '$NCCL', expected $EXPECT_NCCL (+$EXPECT_NCCL_CUDA)"; fi
+if [[ -z "$EXPECT_CUDA" || "$CUDA" == "$EXPECT_CUDA"* ]]; then ok "pack CUDA runtime $CUDA, Open MPI $(pinfo openmpi), nccl-tests $(pinfo nccl_tests)"
+else vbad "pack CUDA runtime is '$CUDA', expected $EXPECT_CUDA"; fi
 
 # IMEX: needed for memory sharing between trays, so a mismatch fails multi-tray runs only
 IMEX=$(pkgs '^nvidia-imex' | head -1); IMEX="${IMEX:-none}"
@@ -226,18 +225,20 @@ DOCA=$(pkgs '^doca-host$' | head -1); [[ -n "$DOCA" ]] || DOCA=$(pkgs '^doca-' |
 if [[ -z "$EXPECT_DOCA" || "$DOCA" == *"$EXPECT_DOCA"* ]]; then ok "DOCA $DOCA"
 else warn "DOCA is '$DOCA', expected DOCA_Host $EXPECT_DOCA"; fi
 
-# Test binaries: present, built with MPI, linked to the system NCCL
+# Pack binaries: every library resolves (pack lib/ + the tray's base OS and
+# driver), and MPI / NCCL come from the pack, not from the tray
 RC_SAVE=$RC; RC=0
-for b in all_reduce_perf alltoall_perf; do
-  BIN="$TESTS_DIR/build/$b"
-  if [[ ! -x "$BIN" ]]; then bad "$BIN missing (deploy_vr_nccl_test.sh builds it; or build nccl-tests with MPI=1 here)"; continue; fi
-  LDD=$(LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>&1)
-  echo "$LDD" | grep -q "not found" && bad "$b: missing libs: $(echo "$LDD" | awk '/not found/{print $1}' | xargs)"
-  echo "$LDD" | grep -q "libmpi" || bad "$b: not built with MPI=1 (no libmpi) -- rebuild: make clean && make MPI=1 ..."
-  LIB=$(echo "$LDD" | awk '/libnccl\.so/ {print $3}')
-  [[ "$LIB" == "/usr/lib/aarch64-linux-gnu/libnccl.so.2" ]] || bad "$b loads NCCL from '${LIB:-nothing}', not the system copy"
+for b in all_reduce_perf alltoall_perf mpirun orted; do
+  BIN="$PACK_DIR/bin/$b"
+  [[ -x "$BIN" ]] || { bad "$BIN missing"; continue; }
+  LDD=$(LD_LIBRARY_PATH="$PACK_DIR/lib" ldd "$BIN" 2>&1)
+  echo "$LDD" | grep -q "not found" && bad "$b: missing libs on this tray: $(echo "$LDD" | awk '/not found/{print $1}' | xargs)"
+  for l in libnccl.so libmpi.so libopen-pal.so; do
+    LIB=$(echo "$LDD" | awk -v l="$l" 'index($1, l)==1 {print $3; exit}')
+    [[ -z "$LIB" || "$LIB" == "$PACK_DIR/lib/"* ]] || bad "$b loads $l from '$LIB', not the pack"
+  done
 done
-[[ $RC -eq 0 ]] && ok "nccl-tests binaries OK ($TESTS_DIR/build)"
+[[ $RC -eq 0 ]] && ok "pack binaries OK ($PACK_DIR/bin)"
 RC=$(( RC | RC_SAVE ))
 
 # Bootstrap interface = the one holding this node's address from the host list.
@@ -301,14 +302,14 @@ P2P_NS=$(nvidia-smi topo -p2p r 2>/dev/null | awk '$1 ~ /^GPU[0-9]+$/ && $2 !~ /
 
 # Stale test processes from an aborted run ("CUDA-capable device(s) is/are busy")
 PIDS=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
-  | grep -E 'all_reduce_perf|alltoall_perf|prterun|prted|mpirun' | awk -F, '{print $1}' | xargs)
+  | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun' | awk -F, '{print $1}' | xargs)
 if [[ -n "$PIDS" ]]; then
   if [[ "$DRY_RUN" -eq 1 ]]; then warn "stale test processes on GPU: $PIDS (would kill)"
   else
     kill -9 $PIDS 2>/dev/null || priv kill -9 $PIDS 2>/dev/null || true
     sleep 2
     if nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>/dev/null \
-        | grep -qE 'all_reduce_perf|alltoall_perf|prterun|prted|mpirun'; then
+        | grep -qE 'all_reduce_perf|alltoall_perf|orted|mpirun'; then
       bad "stale test processes survived kill -9 -- check dmesg for Xid"
     else ok "cleared stale processes: $PIDS"; fi
   fi
@@ -321,32 +322,32 @@ grep -qxF 'pcompress_base_silence_warning = 1' "$HOME/.pmix/mca-params.conf" 2>/
 
 if [[ "$INFO" -eq 1 && "$DRY_RUN" -eq 0 ]]; then rm -rf /tmp/nccl_info && mkdir -p /tmp/nccl_info; fi
 
-echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$(hostname)|$CUDA|$IMEX"
+echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$PSHA|$CUDA|$IMEX"
 REMOTE
 
 MULTI=$(( NODES_REQUESTED > 1 ? 1 : 0 ))
 echo "=== Pre-flight on ${#RUN_NODES[@]} node(s)$([[ $DRY_RUN -eq 1 ]] && echo ' (dry run: check only)') ==="
 FAILED=()
-declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_HOST P_CUDA P_IMEX
+declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX
 for ip in "${RUN_NODES[@]}"; do
   OUT=$(ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
-          "$EXPECT_DRIVER" "$EXPECT_NCCL" "$NCCL_TESTS_DIR" "$CUDA_HOME" \
+          "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
           "$IMEX_CFG" "$HOSTS_RAW" "$DRY_RUN" "$INFO" "$MULTI" "$ip" \
           "$EXPECT_CUDA" "$EXPECT_NCCL_CUDA" "$EXPECT_IMEX" "$EXPECT_NVSHMEM" "$EXPECT_DOCA" \
           "$VERSIONS_WARN" <<< "$REMOTE_PREFLIGHT" 2>&1) || true
   echo "$OUT" | grep -v '^PREFLIGHT|'
   LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
   if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete"; continue; fi
-  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr hname cuda imex <<< "$LINE"
+  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex <<< "$LINE"
   [[ "$rc" == "0" ]] || FAILED+=("$ip")
   P_DRV[$ip]="$drv"; P_NCCL[$ip]="$nccl"; P_CLUSTER[$ip]="$cluster"
-  P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_HOST[$ip]="$hname"
+  P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_SHA[$ip]="$psha"
   P_CUDA[$ip]="$cuda"; P_IMEX[$ip]="$imex"
 done
 
 # All nodes must run the identical stack
 if [[ ${#RUN_NODES[@]} -gt 1 ]]; then
-  for map in P_DRV P_NCCL P_CUDA P_IMEX; do
+  for map in P_DRV P_NCCL P_CUDA P_IMEX P_SHA; do
     declare -n M="$map"
     if [[ $(printf '%s\n' "${M[@]}" | sort -u | wc -l) -gt 1 ]]; then
       echo "  [FAIL] ${map#P_} differs between nodes:"; for ip in "${RUN_NODES[@]}"; do echo "         $ip ${M[$ip]}"; done
@@ -354,13 +355,8 @@ if [[ ${#RUN_NODES[@]} -gt 1 ]]; then
     fi
     unset -n M
   done
-  # Identical hostnames (e.g. all "localhost") made Open MPI hang before NCCL
-  # even started -- it treats ranks with the same hostname as one machine.
-  if [[ $(printf '%s\n' "${P_HOST[@]}" | sort -u | wc -l) -lt ${#RUN_NODES[@]} ]]; then
-    echo "  [FAIL] nodes share a hostname: $(for ip in "${RUN_NODES[@]}"; do printf '%s=%s ' "$ip" "${P_HOST[$ip]}"; done)"
-    echo "         give each node a unique name: sudo hostnamectl set-hostname <name> (and add it to /etc/hosts)"
-    FAILED+=("hostname")
-  fi
+  # No hostname check: the pack's Open MPI 4 runs fine when trays share one
+  # hostname (as GB300 racks do); only the system Open MPI 5 hung on that.
   if [[ $(printf '%s\n' "${P_CLUSTER[@]}" | sort -u | wc -l) -gt 1 ]]; then
     echo "  [WARN] ClusterUUID differs between nodes -> they are NOT in the same NVLink domain;"
     echo "         NCCL cannot use MNNVL between them (needs --allow-ib and working IB/RoCE)."
@@ -383,7 +379,7 @@ for ip in "${RUN_NODES[@]}"; do echo "$ip slots=${GPUS_PER_NODE}"; done > "$HOST
 
 # Bootstrap network (MPI launch + NCCL's socket bootstrap; data goes over
 # NVLink). Interface NAMES differ per node, so:
-#   - OpenMPI/PRRTE get the SUBNET(s) in CIDR form -> valid on every node
+#   - Open MPI (BTL + OOB) gets the SUBNET(s) in CIDR form -> valid on every node
 #   - NCCL gets every node's exact name ("=a,b"); each node uses the one it has
 cidr_net() {  # 192.168.101.136/24 -> 192.168.101.0/24
   local ip="${1%/*}" p="${1#*/}" a b c d n m
@@ -429,17 +425,26 @@ else
 fi
 ENV_ARGS=(); for kv in "${NCCL_ENV[@]}"; do ENV_ARGS+=(-x "$kv"); done
 
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-export PATH="${CUDA_HOME}/bin:${PATH}"
+# The pack's own Open MPI 4.1.6 (built --without-slurm), never the tray's.
+# OPAL_PREFIX makes this relocatable build find its own orted, plugins and
+# help files; exported here so the rsh launcher starts the pack's orted on
+# every tray, and forwarded with -x into every rank (same as GB300).
+MPIRUN="$PACK_DIR/bin/mpirun"
+export OPAL_PREFIX="$PACK_DIR"
+export PATH="$PACK_DIR/bin:$PATH"
+export LD_LIBRARY_PATH="$PACK_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 run_one() {
   local label="$1" bin="$2"; shift 2
-  local cmd=(mpirun "${ROOT_FLAG[@]}"
-    --hostfile "$HOSTFILE" -np "$RUN_GPUS" --map-by "ppr:${GPUS_PER_NODE}:node" --bind-to none
-    --mca pml ob1 --mca btl self,tcp --mca btl_tcp_if_include "$MPI_NET"
-    --prtemca oob_tcp_if_include "$MPI_NET"
+  # --mca schizo ompi: the standard Open MPI CLI personality (the GB300 fix
+  # for "unknown option -np"). OOB + BTL both use the bootstrap subnet(s).
+  local cmd=("$MPIRUN" --mca schizo ompi "${ROOT_FLAG[@]}"
+    --hostfile "$HOSTFILE" -np "$RUN_GPUS" -N "$GPUS_PER_NODE" --bind-to none --oversubscribe
+    --mca pml ob1 --mca btl tcp,self --mca btl_tcp_if_include "$MPI_NET"
+    --mca oob_tcp_if_include "$MPI_NET"
+    --mca coll_hcoll_enable 0
     --mca mca_base_component_show_load_errors 0
-    -x PATH -x LD_LIBRARY_PATH "${ENV_ARGS[@]}"
+    -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH "${ENV_ARGS[@]}"
     "$bin" "$@" -g 1)
   echo "--- ${label} ---"
   echo "+ ${cmd[*]}"
@@ -452,17 +457,17 @@ A2A_ARGS=(-d uint8 -b 8 -e "$MAX_SIZE" -f 2)
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "Hostfile ${HOSTFILE}:"; sed 's/^/  /' "$HOSTFILE"
-  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$NCCL_TESTS_DIR/build/all_reduce_perf" "${AR_ARGS[@]}"
-  run_one "All-to-All (${RUN_GPUS} GPUs)" "$NCCL_TESTS_DIR/build/alltoall_perf" "${A2A_ARGS[@]}"
+  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}"
+  run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}"
   echo "=== Dry run: nothing executed$([[ $PREFLIGHT_RC -ne 0 ]] && echo '; pre-flight FAILED (see above)') ==="
   exit $PREFLIGHT_RC
 fi
 
 {
-  echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | cuda ${P_CUDA[$NODE00]:-?} | nccl ${P_NCCL[$NODE00]:-?} | launch $(hostname)"
-  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$NCCL_TESTS_DIR/build/all_reduce_perf" "${AR_ARGS[@]}" \
+  echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | pack nccl ${P_NCCL[$NODE00]:-?} cuda ${P_CUDA[$NODE00]:-?} sha ${P_SHA[$NODE00]:-?} | launch $(hostname)"
+  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}" \
     || echo "!!! All-Reduce exited with error $?"
-  run_one "All-to-All (${RUN_GPUS} GPUs)" "$NCCL_TESTS_DIR/build/alltoall_perf" "${A2A_ARGS[@]}" \
+  run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
     || echo "!!! All-to-All exited with error $?"
   echo "$(date) : Done."
 } 2>&1 | tee "$LOG"
