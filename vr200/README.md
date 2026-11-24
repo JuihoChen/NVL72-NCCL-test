@@ -63,7 +63,7 @@ bash ~/NVL72-NCCL-test/vr200/pack/build_vr_pack.sh --nccl-tests-src ~/nccl-tests
    (`NCCL_HOME=~/vr-pack-build/nccl`, not `/usr`). The GPU
    architecture comes from this tray's GPUs (`nvidia-smi --query-gpu=compute_cap`,
    SASS + PTX), so the Rubin GPUs are targeted; `NVCC_GENCODE` overrides.
-5. `assemble_pack.sh` copies `libnccl.so.2` (the fetched 2.32.6),
+5. It copies `libnccl.so.2` (the fetched 2.32.6),
    `libcudart.so.13` and every other library the binaries and Open MPI
    plugins need into `lib/`, except the base-OS floor the GB300 audit found
    (glibc, `libstdc++`, `libgcc_s`, `libz`, `libudev`) and the driver
@@ -75,7 +75,18 @@ bash ~/NVL72-NCCL-test/vr200/pack/build_vr_pack.sh --nccl-tests-src ~/nccl-tests
    With `NCCL_DEBUG=VERSION`, the loaded NCCL must report 2.32.6. The
    tarball is only written if that passes.
 
+`build_vr_pack.sh` is a single self-contained file, so copying just that
+file to a tray is enough.
+
 Then copy the tarball next to `deploy_vr_nccl_test.sh` on the jumper.
+
+First build (node136, Nov 24 2026): Ubuntu 26.04, GCC 15.2, CUDA 13.5.37,
+NCCL 2.32.6 from the release `.deb`s, nccl-tests v2.22.0, compute
+capability 10.7 (`sm_107`). Pack 208 MB. Smoke run on 4 GPUs: All-Reduce
+busbw ~630 GB/s at 128 MB, `#wrong` 0. Without `NCCL_IB_DISABLE=1` each
+rank printed `libibverbs: Warning: couldn't load driver 'libionic-rdmav59.so'`
+(an rdma-core provider listed in `/etc/libibverbs.d` but not installed);
+harmless, and the test itself runs with IB disabled.
 
 Pack layout (same as GB300, plus the two info files):
 
