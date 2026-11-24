@@ -7,13 +7,19 @@
 #
 # Run ON node-00, from the run/ folder deploy_rack_nccl_test.sh staged
 # (next to run_nccl_test.sh), with nccl_pairwise_rank.c alongside it.
-# Run run_nccl_test.sh once since the last boot first: its pre-flight repairs
-# nvidia-imex/channel0 and writes the IMEX node list this script reads. This
-# script only CHECKS that state; it repairs nothing. run_nccl_test.sh and
-# deploy_rack_nccl_test.sh are not touched.
+# By default this script only CHECKS node state (imex, channel0, stale GPU
+# processes) and repairs nothing. After a reboot, pass --preflight: it then
+# first runs ONLY the pre-flight part of run_nccl_test.sh (the SSH mesh
+# check, then on every node: write the IMEX node list, repair
+# nvidia-imex/channel0, clear stale perf processes, check the pack), cut out
+# of that file up to its "=== Pre-flight complete ===" line. The nccl-tests
+# sweep after it is never run, so there is no need to run run_nccl_test.sh
+# by hand first. run_nccl_test.sh and deploy_rack_nccl_test.sh are not
+# changed, and an already-staged run_nccl_test.sh works as is.
 #
 #   bash run_gpu_rank.sh               # full rack
 #   bash run_gpu_rank.sh 9             # first 9 nodes only (same rule as run_nccl_test.sh)
+#   bash run_gpu_rank.sh --preflight   # after a reboot: repair node state first
 #   bash run_gpu_rank.sh -- -b 2G -n 20  # pass options through to nccl_pairwise_rank
 #
 # First run: builds bin/nccl_pairwise_rank from nccl_pairwise_rank.c with gcc
@@ -36,18 +42,34 @@ SRC="$SCRIPT_DIR/nccl_pairwise_rank.c"
 BIN="$PACK_DIR/bin/nccl_pairwise_rank"
 MPIRUN_BIN="$PACK_DIR/bin/mpirun"
 COMM_PORT=29517
+RUN_NCCL="$SCRIPT_DIR/run_nccl_test.sh"
+PREFLIGHT_END='echo "=== Pre-flight complete ==="'
+PREFLIGHT=0
 
 NODES_REQUESTED=""
 EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --preflight) PREFLIGHT=1; shift ;;
     --) shift; EXTRA=("$@"); break ;;
     *) NODES_REQUESTED="$1"; shift ;;
   esac
 done
 
-[[ -f "$IMEX_CFG" ]] || { echo "ERROR: $IMEX_CFG not found -- run 'bash $SCRIPT_DIR/run_nccl_test.sh 1' once first" >&2; exit 1; }
+[[ -f "$RUN_NCCL" ]] || { echo "ERROR: $RUN_NCCL not found -- stage it with deploy_rack_nccl_test.sh" >&2; exit 1; }
+
+# --- Pre-flight, taken from run_nccl_test.sh (everything up to its end marker)
+# The node count is passed through, so it gets the same validation there.
+if [[ $PREFLIGHT -eq 1 ]]; then
+  grep -qxF "$PREFLIGHT_END" "$RUN_NCCL" || { echo "ERROR: no '$PREFLIGHT_END' line in $RUN_NCCL --" >&2
+    echo "       re-stage it with deploy_rack_nccl_test.sh, or run without --preflight" >&2; exit 1; }
+  echo "=== Running run_nccl_test.sh pre-flight only (no nccl-tests sweep) ==="
+  bash <(sed "\\|^${PREFLIGHT_END}\$|q" "$RUN_NCCL") ${NODES_REQUESTED:+"$NODES_REQUESTED"} \
+    || { echo "ERROR: pre-flight from $RUN_NCCL failed (see above)" >&2; exit 1; }
+fi
+
+[[ -f "$IMEX_CFG" ]] || { echo "ERROR: $IMEX_CFG not found -- rerun with --preflight" >&2; exit 1; }
 mapfile -t ALL_NODES < <(awk 'NF{print $1}' "$IMEX_CFG")
 NODES_REQUESTED="${NODES_REQUESTED:-${#ALL_NODES[@]}}"
 if ! [[ "$NODES_REQUESTED" =~ ^[0-9]+$ ]] || [[ $NODES_REQUESTED -lt 1 || $NODES_REQUESTED -gt ${#ALL_NODES[@]} ]]; then
@@ -56,8 +78,8 @@ fi
 NODES=("${ALL_NODES[@]:0:$NODES_REQUESTED}")
 RUN_GPUS=$(( NODES_REQUESTED * GPUS_PER_NODE ))
 
-MNNVL_UUID=$(grep -oE 'NCCL_MNNVL_UUID=0x[0-9A-Fa-f]+' "$SCRIPT_DIR/run_nccl_test.sh" 2>/dev/null | head -1 | cut -d= -f2)
-[[ -n "$MNNVL_UUID" ]] || { echo "ERROR: could not read NCCL_MNNVL_UUID from $SCRIPT_DIR/run_nccl_test.sh" >&2; exit 1; }
+MNNVL_UUID=$(grep -oE 'NCCL_MNNVL_UUID=0x[0-9A-Fa-f]+' "$RUN_NCCL" 2>/dev/null | head -1 | cut -d= -f2)
+[[ -n "$MNNVL_UUID" ]] || { echo "ERROR: could not read NCCL_MNNVL_UUID from $RUN_NCCL" >&2; exit 1; }
 [[ -f "$MPIRUN_BIN" ]] || { echo "ERROR: $MPIRUN_BIN not found" >&2; exit 1; }
 
 # --- Build (node-00 only, once; rebuilt if the source is newer) -------------
@@ -93,8 +115,13 @@ done
 BAD=0
 for ip in "${NODES[@]}"; do wait "${PIDS[$ip]}" || BAD=1; done
 if [[ $BAD -ne 0 ]]; then
-  echo "ERROR: some node(s) not ready -- run 'bash $SCRIPT_DIR/run_nccl_test.sh 1' (its pre-flight" >&2
-  echo "       repairs imex/channel0 and clears stale processes), then retry." >&2
+  if [[ $PREFLIGHT -eq 1 ]]; then
+    echo "ERROR: some node(s) not ready after the pre-flight -- a leftover nccl_pairwise_rank" >&2
+    echo "       is not cleared by it: kill it on that node (or check dmesg for Xid), then retry." >&2
+  else
+    echo "ERROR: some node(s) not ready -- rerun with --preflight (it repairs" >&2
+    echo "       imex/channel0 and clears stale perf processes)." >&2
+  fi
   exit 1
 fi
 echo "    all ${#NODES[@]} node(s) ready"
