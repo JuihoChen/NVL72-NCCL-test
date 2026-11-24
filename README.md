@@ -1,6 +1,21 @@
 # NVL72-NCCL-test
 Deployment scripts and diagnostics for NCCL tests on 18-node/72-GPU GB300 racks — hostfile setup, IMEX pre-flight checks, and fixes for socket/NVLink hangs.
 
+## VR200 (Vera Rubin NVL72) compute trays
+
+`vr200/` has the VR200 counterpart of `deploy_rack_nccl_test.sh`.
+`deploy_vr_nccl_test.sh` runs from the jumper: it meshes SSH, checks
+hostnames (identical ones hang Open MPI 5), builds stock nccl-tests once on
+tray 1 against the system NCCL and copies it to every tray, and stages
+`run_vr_nccl_test.sh` on tray 1 with its pre-flight (stack versions, IMEX,
+fabric health, P2P). No test pack: the trays' own release stack is used.
+See [vr200/README.md](vr200/README.md).
+
+```bash
+cd vr200
+./deploy_vr_nccl_test.sh --hosts <tray1-ip>,<tray2-ip> --auto
+```
+
 ## Ranking all GPUs by speed in one run
 
 `gpu_rank/` ranks every GPU of the rack by NCCL point-to-point bandwidth from

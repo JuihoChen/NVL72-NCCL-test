@@ -1,58 +1,125 @@
-# VR200 bring-up: NCCL test across compute trays
+# VR200: NCCL tests across compute trays
 
-`run_vr_nccl_test.sh` runs nccl-tests (All-Reduce + All-to-All) across one or
-more VR200 compute trays, launched from the first tray. It is derived from
-`../deploy_rack_nccl_test.sh` (its `run_nccl_test.sh` part) but uses what is
-installed on the trays instead of a test pack:
+Two scripts, the VR200 counterparts of the GB300 flow:
 
-| | GB300 rack script | `run_vr_nccl_test.sh` |
+| | GB300 | VR200 |
 |---|---|---|
-| NCCL | pack's own `lib/` | system `libnccl2` (dev drop, e.g. `2.32.4gr100`) |
+| Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
+| Test, on node-00 / tray 1 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
+| NCCL | pack's own `lib/` | system `libnccl2`, stock release (2.32.6+cuda13.5) |
 | MPI | pack's Open MPI 4 (`orted`) | Ubuntu Open MPI 5 (`prterun`) |
-| nccl-tests | pack's `bin/` | built on each tray with `MPI=1` |
-| Jumper / SSH mesh | yes | no: run on tray 1, needs SSH to every tray incl. itself |
-| User | root | root or a normal user (repairs then use `sudo -n`) |
+| nccl-tests | pack's `bin/` | stock source, built once on tray 1 with `MPI=1`, copied to every tray |
+| User | root | root, or a normal user with `--user` (repairs then use `sudo -n`) |
 
-The NCCL settings match the rack script (MNNVL auto, NVLS on, IB off).
+Nothing on the trays is patched: no test pack, no `LD_LIBRARY_PATH`
+overrides, no rebuilt NCCL. The NCCL settings match the rack script
+(MNNVL auto, NVLS on, IB off).
 
-## Usage
+## Target stack (VR NVL72 1.0.0 RC)
 
-On the first tray (first IP in `--hosts`, default `192.168.101.136,192.168.101.137`):
+The pre-flight checks each tray against these defaults. Matching is by
+substring, and each one can be overridden in the environment (on the
+jumper, it is then written to `vr_nccl.conf`; set it to `""` to skip it).
+
+| Component | Variable | Default | Mismatch |
+|---|---|---|---|
+| Driver (user space and kernel module) | `EXPECT_DRIVER` | `620.70.08` | FAIL |
+| CUDA (`$CUDA_HOME/version.json`) | `EXPECT_CUDA` | `13.5.0` | FAIL |
+| `libnccl2` | `EXPECT_NCCL` + `EXPECT_NCCL_CUDA` | `2.32.6` + `cuda13.5` | FAIL |
+| IMEX (`nvidia-imex*` package / `--version`) | `EXPECT_IMEX` | `2.0.0` | FAIL on multi-tray runs |
+| NVSHMEM (`nvshmem*` package) | `EXPECT_NVSHMEM` | `3.8.0` | WARN (not used by nccl-tests) |
+| DOCA Host (`doca-host` package) | `EXPECT_DOCA` | `3.3.3` | WARN (not used by nccl-tests) |
+
+`--versions-warn` (on either script) turns the FAIL mismatches into
+warnings, for trying a newer drop. All trays must still match each other
+(driver, CUDA, NCCL, IMEX).
+
+## Deploy (from the jumper)
 
 ```bash
-bash run_vr_nccl_test.sh --dry-run      # pre-flight only, prints the mpirun lines
+./deploy_vr_nccl_test.sh --hosts 192.168.101.136,192.168.101.137   # tray 1 first
+./deploy_vr_nccl_test.sh rackNN.sh                  # or CM_IPS from a GB300-style rack file
+./deploy_vr_nccl_test.sh rackNN.sh --set-hostnames vr200   # cloned image: rename to vr200-nNN
+./deploy_vr_nccl_test.sh rackNN.sh --nccl-tests-src nccl-tests.tar.gz   # trays without internet
+./deploy_vr_nccl_test.sh rackNN.sh --user nvidia    # SSH and run as nvidia instead of root
+./deploy_vr_nccl_test.sh rackNN.sh --auto -- 1      # deploy, then run the test on 1 tray
+./deploy_vr_nccl_test.sh rackNN.sh --dry-run        # print what would be done
+```
+
+Tray 1 (first in `--hosts`, or the LAST entry of `CM_IPS`, the same
+reversal as the GB300 script) is the launch node. Steps:
+
+0. Passwordless SSH jumper -> every tray (`--bootstrap [password]` seeds
+   the jumper's key with `sshpass` first). Stale `known_hosts` entries are
+   cleared, so a swapped tray on a reused IP is fine.
+1. SSH mesh tray 1 -> every tray, itself included, verified from tray 1
+   (mpirun and the pre-flight use it; a missing link would hang mpirun).
+2. Hostnames must be unique: identical hostnames hang Open MPI 5 (finding 3
+   below). `--set-hostnames <prefix>` sets `<prefix>-n00`, `-n01`, ... in
+   tray order and writes a marked `# vr-nccl` block with all trays into
+   `/etc/hosts`.
+3. nccl-tests: the stock source (cloned on tray 1 from
+   `NCCL_TESTS_REPO`, optionally at `NCCL_TESTS_REF`, or pushed with
+   `--nccl-tests-src <dir|tar.gz>`) is built once on tray 1 with
+   `make MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/cuda`
+   against the system NCCL (`libnccl-dev` must match `libnccl2`), then
+   `build/` is copied to the same path on every tray. A stamp
+   (NCCL / nvcc / Open MPI versions + source checksum) skips the build and
+   the copies when nothing changed, so after a stack upgrade a re-deploy
+   rebuilds by itself. `--rebuild` forces it; `NVCC_GENCODE` is passed to
+   make when set.
+4. `run_vr_nccl_test.sh` and `vr_nccl.conf` (host list, paths, optional
+   `--uuid` and pinned versions) are staged on tray 1.
+5. `run_vr_nccl_test.sh --check` runs the full pre-flight on tray 1. The
+   deploy exits non-zero if it fails (`--no-check` skips it).
+
+Layout on the trays (`--data-dir`, default `<user's home>/vr-nccl`):
+
+```
+vr-nccl/nccl-tests/            source + build/ (every tray, same path)
+vr-nccl/run/run_vr_nccl_test.sh
+vr-nccl/run/vr_nccl.conf
+vr-nccl/run/results/           logs + hostfiles (tray 1)
+```
+
+A reboot needs no re-deploy: the test repairs IMEX / channel0 and clears
+stale processes every time. Re-deploy after a tray swap, a reimage or a
+stack upgrade.
+
+## Test (on tray 1)
+
+```bash
+cd ~/vr-nccl/run
+bash run_vr_nccl_test.sh --check        # pre-flight only, prints the mpirun lines
 bash run_vr_nccl_test.sh 1              # first tray only (4 GPUs)
 bash run_vr_nccl_test.sh                # all trays
 bash run_vr_nccl_test.sh --info         # NCCL INFO -> /tmp/nccl_info/ on each tray
 bash run_vr_nccl_test.sh --no-nvls      # skip NVLink-switch multicast (NVLS)
 bash run_vr_nccl_test.sh --no-mnnvl     # control run: no NVLink between trays (TCP, slow)
-bash run_vr_nccl_test.sh --hosts ip1,ip2,ip3 --max-size 8G
+bash run_vr_nccl_test.sh --max-size 8G
 ```
 
-nccl-tests is looked for in `$NCCL_TESTS_DIR`, `~/nccl-tests`, then
-`/home/nvidia/nccl-tests`. Logs go to `~/nccl-results/`.
+Settings come from built-in defaults < `vr_nccl.conf` < environment <
+command line. Without a conf (the bring-up way) pass `--hosts ip1,ip2`
+and the script looks for nccl-tests in `$NCCL_TESTS_DIR`, `~/nccl-tests`,
+then `/home/nvidia/nccl-tests`; logs then go to `~/nccl-results/`.
 
-Build nccl-tests on every tray at the same path:
+### Pre-flight checks (per tray, over SSH)
 
-```bash
-git clone https://github.com/NVIDIA/nccl-tests.git && cd nccl-tests
-make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/cuda
-```
-
-## Pre-flight checks (per tray, over SSH)
-
-- driver version in user space **and** kernel module (`EXPECT_DRIVER`, default 620.62)
+- stack versions (table above); driver user space **and** kernel module
+  must agree (finding 1)
 - `nvidia-smi` works, 4 GPUs visible
-- `libnccl2` version (`EXPECT_NCCL`, default 2.32.4gr100)
 - nccl-tests built with MPI and linked to the system `libnccl.so.2`
 - bootstrap interface: each tray reports its own (names differ per tray, e.g. `enx<MAC>`)
 - multi-tray runs: IMEX node list, `nvidia-imex` active, IMEX channel0, fabric `State`
 - fabric **health**: `Summary: Healthy`, `Route Unhealthy: False`
 - `nvidia-smi topo -p2p r` is `OK` for every GPU pair
 - stale test processes cleared
-- across trays: same driver and NCCL, same `ClusterUUID`, **unique hostnames**
+- across trays: same driver, CUDA, NCCL and IMEX, same `ClusterUUID`, **unique hostnames**
 
-## Findings from the first two trays (Nov 2026)
+## Findings from the first two trays (bring-up, Nov 2026)
+
+These were seen on the earlier dev stack (driver 620.62, NCCL 2.32.4gr100).
 
 1. **Driver 615.62 -> 620.62.** 615.62 was installed with apt; installing the
    620.62 `.run` on top left both drivers on disk and the initramfs kept loading
@@ -115,7 +182,10 @@ make -j MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_HOME=/usr/local/c
    the partition had become healthy fixed it** (both re-registered with the same
    mode). Check with `sudo dmesg -T | grep -i bwMode` after a cross-tray failure.
 
-## Baselines (driver 620.62, NCCL 2.32.4gr100, Nov 20 2026)
+## Baselines (bring-up stack: driver 620.62, NCCL 2.32.4gr100, Nov 20 2026)
+
+To be re-measured on the 1.0.0 RC stack.
+
 
 | Run | All-Reduce busbw @ 32 GB | All-to-All busbw @ 32 GB |
 |---|---|---|
