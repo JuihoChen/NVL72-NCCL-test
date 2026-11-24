@@ -68,14 +68,17 @@ if [[ $PREFLIGHT -eq 1 ]]; then
   # An older staged run_nccl_test.sh labels its pre-flight lines [$(hostname)],
   # which is the same on every node of some racks. Relabel those lines nNN/IP
   # (position in the IMEX node list it has just written + IP), as deploy
-  # v0.24+ already does, so a re-stage is not needed. A v0.24+ file has no
-  # $(hostname) labels left, so only the label line is added (same result).
-  bash <(sed -e "\\|^${PREFLIGHT_END}\$|q" \
-             -e "/<<'REMOTE'\$/,/^REMOTE\$/{
+  # v0.24+ already does, so a re-stage is not needed. A v0.24+ file (it sets
+  # NODE_LABEL itself) is left exactly as it is.
+  RELABEL=()
+  if ! grep -q '^NODE_LABEL=' "$RUN_NCCL"; then
+    RELABEL=(-e "/<<'REMOTE'\$/,/^REMOTE\$/{
                    /^set -e\$/a\\
-NODE_LABEL=\$(awk -v me=\" \$(hostname -I 2>/dev/null) \" 'NF { if (index(me, \" \" \$1 \" \")) { printf \"n%02d/%s\", n, \$1; exit } n++ }' $IMEX_CFG 2>/dev/null); NODE_LABEL=\${NODE_LABEL:-\$(hostname)}
+NODE_LABEL=\$(awk -v me=\" \$(hostname -I 2>/dev/null) \" 'NF { if (index(me, \" \" \$1 \" \")) { printf \"n%02d/%s\", n, \$1; exit } n++ }' $IMEX_CFG 2>/dev/null || true); NODE_LABEL=\${NODE_LABEL:-\$(hostname)}
                    s/\\\$(hostname)/\$NODE_LABEL/g
-                 }" "$RUN_NCCL") ${NODES_REQUESTED:+"$NODES_REQUESTED"} \
+                 }")
+  fi
+  bash <(sed -e "\\|^${PREFLIGHT_END}\$|q" "${RELABEL[@]}" "$RUN_NCCL") ${NODES_REQUESTED:+"$NODES_REQUESTED"} \
     || { echo "ERROR: pre-flight from $RUN_NCCL failed (see above)" >&2; exit 1; }
 fi
 

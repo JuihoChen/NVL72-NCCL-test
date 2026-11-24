@@ -552,8 +552,9 @@ for ip in "\${NODES[@]}"; do
 set -e
 # Every node of a rack can share one hostname, so label lines by position
 # in the IMEX node list (written just above) plus IP, the same nNN/IP form
-# the GPU ranking uses: n00 = node-00. Falls back to the hostname.
-NODE_LABEL=\$(awk -v me=" \$(hostname -I 2>/dev/null) " 'NF { if (index(me, " " \$1 " ")) { printf "n%02d/%s", n, \$1; exit } n++ }' ${IMEX_CFG} 2>/dev/null)
+# the GPU ranking uses: n00 = node-00. Falls back to the hostname; never
+# fails (|| true), since this script runs under set -e.
+NODE_LABEL=\$(awk -v me=" \$(hostname -I 2>/dev/null) " 'NF { if (index(me, " " \$1 " ")) { printf "n%02d/%s", n, \$1; exit } n++ }' ${IMEX_CFG} 2>/dev/null || true)
 NODE_LABEL=\${NODE_LABEL:-\$(hostname)}
 if ! systemctl is-active --quiet nvidia-imex; then
   echo "  [\$NODE_LABEL] nvidia-imex not active -- restarting..."
