@@ -178,8 +178,13 @@ All trays must also agree with each other on driver, IMEX and pack.
 - multi-tray runs: IMEX node list, `nvidia-imex` active, IMEX channel0, fabric `State`
 - fabric **health**: `Summary: Healthy`, `Route Unhealthy: False`
 - `nvidia-smi topo -p2p r` is `OK` for every GPU pair
+- per-link NVLink state (`nvidia-smi nvlink -s`): no link inactive/down, and
+  every GPU has the same number of active links
+- no `bwMode does not match` in `dmesg` since boot (finding 4; skipped if
+  `dmesg` is not readable)
 - stale test processes (`*_perf`, `orted`, `mpirun`) cleared
-- across trays: same driver, IMEX and pack (sha256), same `ClusterUUID`
+- across trays: same driver, IMEX, pack (sha256) and active links per GPU,
+  same `ClusterUUID`
 
 ## Findings from the first two trays (bring-up, Nov 2026)
 

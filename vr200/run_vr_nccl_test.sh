@@ -155,7 +155,7 @@ echo "    OK"
 
 # --- 2. Per-node pre-flight (runs ON each node over SSH) -------------------
 # Prints its checks, then one machine-readable line:
-#   PREFLIGHT|<rc>|<driver>|<pack nccl>|<fabric>|<cluster>|<if>|<cidr>|<pack sha>|<pack cuda>|<imex>
+#   PREFLIGHT|<rc>|<driver>|<pack nccl>|<fabric>|<cluster>|<if>|<cidr>|<pack sha>|<pack cuda>|<imex>|<nvlinks/GPU>
 read -r -d '' REMOTE_PREFLIGHT <<'REMOTE' || true
 set -uo pipefail
 EXPECT_DRIVER="$1"; EXPECT_NCCL="$2"; PACK_DIR="$3"; PACK_CACHE="$4"
@@ -299,6 +299,32 @@ fi
 P2P_NS=$(nvidia-smi topo -p2p r 2>/dev/null | awk '$1 ~ /^GPU[0-9]+$/ && $2 !~ /^GPU/ {for(i=2;i<=NF;i++) if($i!="X" && $i!="OK") n++} END{print n+0}')
 [[ "$P2P_NS" -eq 0 ]] && ok "GPU P2P OK between all GPU pairs" || bad "GPU P2P not OK for $P2P_NS GPU pair entries (nvidia-smi topo -p2p r)"
 
+# Per-link NVLink state: no link down/inactive, and every GPU with the same
+# number of active links (one dead link shows up here before it costs busbw)
+NVL=$(nvidia-smi nvlink -s 2>/dev/null)
+LINKS="?"
+if [[ -n "$NVL" ]]; then
+  read -r NG LMIN LMAX DOWN <<< "$(echo "$NVL" | awk '
+    /^GPU [0-9]+/ {g++; a[g]=0; next}
+    /Link [0-9]+:/ { if (tolower($0) ~ /inactive|down|n\/a/) d++; else a[g]++ }
+    END { min=-1; max=0; for (i=1; i<=g; i++) { if (min<0 || a[i]<min) min=a[i]; if (a[i]>max) max=a[i] }
+          print g+0, (min<0 ? 0 : min), max, d+0 }')"
+  LINKS="$LMAX"
+  if [[ "$DOWN" -eq 0 && "$LMIN" -eq "$LMAX" && "$LMAX" -gt 0 ]]; then ok "NVLink: $NG GPUs x $LMAX active links each"
+  else bad "NVLink: $DOWN link(s) inactive/down, active links per GPU $LMIN..$LMAX (nvidia-smi nvlink -s)"; fi
+else
+  warn "nvidia-smi nvlink -s gave no output (NVLink state not checked)"
+fi
+
+# Finding 4: GPUs registered with different NVLink bandwidth modes refuse
+# cross-tray memory import. The kernel log says so; reboot both trays once the
+# partition is healthy. dmesg may need root: skipped if unreadable.
+if DM=$(dmesg 2>/dev/null || priv dmesg 2>/dev/null); then
+  BW=$(echo "$DM" | grep -c "bwMode does not match" || true)
+  [[ "$BW" -eq 0 ]] && ok "no NVLink bwMode mismatch in dmesg" \
+    || bad "dmesg: $BW 'bwMode does not match' line(s) since boot -- cross-tray NVLink will fail; reboot the trays (README finding 4)"
+fi
+
 
 # Stale test processes from an aborted run ("CUDA-capable device(s) is/are busy")
 PIDS=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
@@ -322,13 +348,13 @@ grep -qxF 'pcompress_base_silence_warning = 1' "$HOME/.pmix/mca-params.conf" 2>/
 
 if [[ "$INFO" -eq 1 && "$DRY_RUN" -eq 0 ]]; then rm -rf /tmp/nccl_info && mkdir -p /tmp/nccl_info; fi
 
-echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$PSHA|$CUDA|$IMEX"
+echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$PSHA|$CUDA|$IMEX|$LINKS"
 REMOTE
 
 MULTI=$(( NODES_REQUESTED > 1 ? 1 : 0 ))
 echo "=== Pre-flight on ${#RUN_NODES[@]} node(s)$([[ $DRY_RUN -eq 1 ]] && echo ' (dry run: check only)') ==="
 FAILED=()
-declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX
+declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS
 for ip in "${RUN_NODES[@]}"; do
   OUT=$(ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
           "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
@@ -338,16 +364,16 @@ for ip in "${RUN_NODES[@]}"; do
   echo "$OUT" | grep -v '^PREFLIGHT|'
   LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
   if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete"; continue; fi
-  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex <<< "$LINE"
+  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex links <<< "$LINE"
   [[ "$rc" == "0" ]] || FAILED+=("$ip")
   P_DRV[$ip]="$drv"; P_NCCL[$ip]="$nccl"; P_CLUSTER[$ip]="$cluster"
-  P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_SHA[$ip]="$psha"
+  P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_SHA[$ip]="$psha"; P_NVLINKS[$ip]="$links"
   P_CUDA[$ip]="$cuda"; P_IMEX[$ip]="$imex"
 done
 
 # All nodes must run the identical stack
 if [[ ${#RUN_NODES[@]} -gt 1 ]]; then
-  for map in P_DRV P_NCCL P_CUDA P_IMEX P_SHA; do
+  for map in P_DRV P_NCCL P_CUDA P_IMEX P_SHA P_NVLINKS; do
     declare -n M="$map"
     if [[ $(printf '%s\n' "${M[@]}" | sort -u | wc -l) -gt 1 ]]; then
       echo "  [FAIL] ${map#P_} differs between nodes:"; for ip in "${RUN_NODES[@]}"; do echo "         $ip ${M[$ip]}"; done
