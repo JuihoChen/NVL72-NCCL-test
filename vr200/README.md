@@ -9,7 +9,7 @@ repo are untouched; everything VR200 lives in this folder.
 | Pack build | `nccl_arm64.Dockerfile` (in `../GB300_mpirun_NCCL_diag_deployment.md`) | `pack/build_vr_pack.sh`, natively on a VR200 tray (no Docker) |
 | Pack | `nccl-test-pack-arm64.tar.gz` | `nccl-test-pack-vr-arm64.tar.gz` |
 | Deploy, from the jumper | `../deploy_rack_nccl_test.sh` | `deploy_vr_nccl_test.sh` |
-| Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh` (+ `vr_nccl.conf`) |
+| Test, on node-00 | generated `run_nccl_test.sh` | `run_vr_nccl_test.sh`, staged with the rack settings injected |
 | Open MPI | 4.1.6 `--without-slurm`, in the pack | same |
 | NCCL | 2.28.7 (built from tag), in the pack | stock 2.32.6-1+cuda13.5 release `.deb`s (or the `v2.32.6-1` tag), fetched by the build, in the pack |
 | CUDA runtime | 13.0, in the pack | 13.5, in the pack |
@@ -124,8 +124,10 @@ picks it). Steps:
    copied again (GB300 compares sizes). The old `bin/ lib/ share/` are
    replaced, so no library of an older pack is left behind.
 2. SSH mesh node-00 -> every tray, itself included, verified from node-00.
-3. `run_vr_nccl_test.sh` and `vr_nccl.conf` (hosts, pack paths, UUID,
-   pinned versions) are staged in `<data-dir>/run/` on node-00.
+3. `run_vr_nccl_test.sh` is staged in `<data-dir>/run/` on node-00 with
+   the rack settings (hosts, pack paths, UUID, pinned versions) injected
+   into it, like GB300's generated `run_nccl_test.sh`: one ready-to-run
+   file, nothing else to copy.
 4. `run_vr_nccl_test.sh --check` runs the full pre-flight on node-00; the
    deploy exits non-zero if it fails (`--no-check` skips it).
 
@@ -149,13 +151,15 @@ bash run_vr_nccl_test.sh --no-mnnvl     # control run: no NVLink between trays (
 bash run_vr_nccl_test.sh --max-size 8G
 ```
 
-Settings: built-in defaults < `vr_nccl.conf` < environment < command line.
+Settings: built-in defaults < the injected rack settings < environment <
+command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
+can supply them instead.)
 Logs and hostfiles go to `<data-dir>/run/results/`.
 
 ### Target versions
 
 Matching is by substring. Each can be overridden in the environment (on the
-jumper it is then written to `vr_nccl.conf`); `""` skips that check.
+jumper it is then injected into the staged script); `""` skips that check.
 `--versions-warn` (either script) turns FAIL into WARN, to try a newer drop.
 All trays must also agree with each other on driver, IMEX and pack.
 

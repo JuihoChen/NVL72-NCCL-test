@@ -1,8 +1,8 @@
 #!/bin/bash
 # run_vr_nccl_test.sh -- multi-tray NCCL test for VR200 compute trays, launched from node-00
 #
-# Staged on node-00 (tray 1) by ../deploy_vr_nccl_test.sh, which also writes
-# vr_nccl.conf next to it (host list, pack location, UUID). The VR200
+# Staged on node-00 (tray 1) by ../deploy_vr_nccl_test.sh, which injects the
+# rack settings (host list, pack location, UUID) into the staged copy. The VR200
 # counterpart of the run_nccl_test.sh that deploy_rack_nccl_test.sh generates
 # for GB300, and the same model:
 #   - every tray runs the test PACK (nccl-test-pack-vr-arm64.tar.gz, built by
@@ -33,7 +33,7 @@
 #                                            # MPI/NCCL/tests are fine apart from the fabric
 #                                            # (default max size then 64M)
 #
-# Settings, lowest to highest priority: built-in defaults < vr_nccl.conf <
+# Settings, lowest to highest priority: built-in defaults < vr_nccl.conf < injected rack settings <
 # environment < command line. Environment / conf variables:
 #   HOSTS        comma-separated tray IPs, node-00 first (or use --hosts)
 #   PACK_DIR     extracted pack (default /root/portable-nccl, or ~/portable-nccl)
@@ -50,6 +50,11 @@ set -euo pipefail
 SCRIPT_VERSION="0.9-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
+# it stages this script on node-00 (like GB300's generated run_nccl_test.sh).
+# @@DEPLOY_SETTINGS@@
+# --- end of rack settings ---
+# Optional extra settings file (standalone use): vr_nccl.conf next to this script
 CONF="${VR_NCCL_CONF:-$SCRIPT_DIR/vr_nccl.conf}"
 # The conf only fills variables the environment has not set ("${X:-...}")
 # shellcheck source=/dev/null

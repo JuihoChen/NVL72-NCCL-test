@@ -13,7 +13,8 @@
 #         persists across reboots; nothing on the OS image is touched.
 #   [2/4] meshes SSH tray 1 -> every tray, itself included (mpirun uses it),
 #         and verifies it from tray 1
-#   [3/4] stages run_vr_nccl_test.sh + vr_nccl.conf on tray 1
+#   [3/4] stages run_vr_nccl_test.sh on node-00 with the rack settings
+#         (hosts, pack paths, UUID) injected, like GB300's run_nccl_test.sh
 #   [4/4] runs its pre-flight (run_vr_nccl_test.sh --check) on tray 1:
 #         driver / IMEX / pack versions, IMEX + channel0, fabric health,
 #         GPU P2P, pack binaries
@@ -40,8 +41,8 @@
 #   --versions-warn      version mismatches in the pre-flight are warnings
 #   --no-check           skip step [4/4]
 #
-# EXPECT_* variables set here (see run_vr_nccl_test.sh) are written to
-# vr_nccl.conf and so pinned for later runs.
+# EXPECT_* variables set here (see run_vr_nccl_test.sh) are injected into
+# the staged script and so pinned for later runs.
 #
 # After a reboot nothing needs redeploying: run_vr_nccl_test.sh repairs
 # IMEX / channel0, clears stale processes and, if needed, re-extracts the
@@ -269,8 +270,8 @@ EOF
 fi
 
 # --- [3/4] stage the runner + its config on tray 1 ---------------------------
-echo "--- [3/4] Staging run_vr_nccl_test.sh + vr_nccl.conf in ${RUN_DIR} on node-00 ---"
-CONF="# vr_nccl.conf -- written by deploy_vr_nccl_test.sh ${SCRIPT_VERSION}, $(date -u '+%Y-%m-%d %H:%M UTC')
+echo "--- [3/4] Staging run_vr_nccl_test.sh (rack settings injected) in ${RUN_DIR} on node-00 ---"
+CONF="# Injected by deploy_vr_nccl_test.sh ${SCRIPT_VERSION}, $(date -u '+%Y-%m-%d %H:%M UTC')
 # source: ${RACK_FILE:-"--hosts"}, pack ${PACK_BASENAME} sha256 ${PACK_SHA:0:16}
 # Environment variables win over these values.
 HOSTS=\"\${HOSTS:-$HOSTS_CSV}\"
@@ -284,12 +285,19 @@ for v in EXPECT_DRIVER EXPECT_CUDA EXPECT_NCCL EXPECT_NCCL_CUDA EXPECT_IMEX EXPE
   # Only versions set on the jumper are pinned; otherwise the runner's defaults apply
   [[ -n "${!v+x}" ]] && CONF+="$v=\"\${$v-${!v}}\""$'\n'
 done
+build_runner() {  # the runner with $CONF in place of its @@DEPLOY_SETTINGS@@ line
+  local n; n=$(grep -c '^# @@DEPLOY_SETTINGS@@$' "$RUNNER" || true)
+  [[ "$n" -eq 1 ]] || { echo "ERROR: $RUNNER has no @@DEPLOY_SETTINGS@@ marker" >&2; return 1; }
+  CONF="$CONF" awk '$0 == "# @@DEPLOY_SETTINGS@@" { printf "%s", ENVIRON["CONF"]; next } { print }' "$RUNNER"
+}
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "[DRY-RUN] would copy $RUNNER and write ${RUN_DIR}/vr_nccl.conf:"
+  echo "[DRY-RUN] would stage ${RUN_DIR}/run_vr_nccl_test.sh on node-00 with these settings injected:"
   echo "$CONF" | sed 's/^/    /'
 else
-  ssh_to "$NODE00" "mkdir -p '${RUN_DIR}/results' && cat > '${RUN_DIR}/run_vr_nccl_test.sh' && chmod +x '${RUN_DIR}/run_vr_nccl_test.sh'" < "$RUNNER"
-  ssh_to "$NODE00" "cat > '${RUN_DIR}/vr_nccl.conf'" <<< "$CONF"
+  # GB300 style: one ready-to-run script on node-00, rack settings baked in.
+  # A vr_nccl.conf from an older deploy is removed so it cannot override them.
+  STAGED=$(build_runner)   # built first: a failure must not leave an empty script on node-00
+  ssh_to "$NODE00" "mkdir -p '${RUN_DIR}/results' && rm -f '${RUN_DIR}/vr_nccl.conf' && cat > '${RUN_DIR}/run_vr_nccl_test.sh' && chmod +x '${RUN_DIR}/run_vr_nccl_test.sh'" <<< "$STAGED"
   echo "    OK"
 fi
 
