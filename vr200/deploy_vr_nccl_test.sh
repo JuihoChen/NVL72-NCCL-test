@@ -344,7 +344,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.11-vr"
+SCRIPT_VERSION="0.12-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -812,12 +812,19 @@ fi
 # NCCL 2.32 probes its internal RMA/GIN plugins at every comm init, even with
 # NCCL_IB_DISABLE=1 and no GDRCopy, and each rank prints two WARN lines that do
 # not affect the run (no NCCL setting skips that probe). They are hidden on the
-# console only, counted at the end, and kept in the log; --all-warnings shows them.
-KNOWN_WARN_RE='ibvwrap\.cc:[0-9]+ .*NCCL WARN lib wrapper not initialized|rma_socket\.cc:[0-9]+ .*NCCL WARN RMA/Socket : rma_socket requires GDRCopy'
+# console only (with the empty line NCCL prints before each), counted at the end,
+# and kept in the log; --all-warnings shows them.
+KNOWN_WARN_RE='ibvwrap[.]cc:[0-9]+ .*NCCL WARN lib wrapper not initialized|rma_socket[.]cc:[0-9]+ .*NCCL WARN RMA/Socket : rma_socket requires GDRCopy'
 hide_known_warns() {
   if [[ $ALL_WARNINGS -eq 1 ]]; then cat; return; fi
-  awk -v re="$KNOWN_WARN_RE" '$0 ~ re { n++; next } { print; fflush() }
-    END { if (n) printf "(%d known-harmless NCCL init WARN line(s) hidden: ibv_alloc_pd wrapper / RMA socket GDRCopy; see the log or --all-warnings)\n", n }'
+  # NCCL prints an empty line before every WARN: a hidden WARN takes one pending
+  # empty line with it; other empty lines are printed as they were.
+  awk -v re="$KNOWN_WARN_RE" '
+    /^[[:space:]]*$/ { blank++; next }
+    $0 ~ re { n++; if (blank) blank--; next }
+    { while (blank) { print ""; blank-- } print; fflush() }
+    END { while (blank) { print ""; blank-- }
+          if (n) printf "(%d known-harmless NCCL init WARN line(s) hidden: ibv_alloc_pd wrapper / RMA socket GDRCopy; see the log or --all-warnings)\n", n }'
 }
 
 {
