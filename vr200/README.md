@@ -157,6 +157,13 @@ command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
 can supply them instead.)
 Logs and hostfiles go to `<data-dir>/run/results/`.
 
+`NCCL_MNNVL_ENABLE` stays at 2 (auto), as on GB300: NCCL uses NVLink between
+trays when IMEX and the fabric are healthy. The risk with auto is that it falls
+back to sockets silently, so a multi-tray run whose peak busbw at 64 MB or more
+is below `MIN_MNNVL_BUSBW` (default 100 GB/s) is marked FAIL. Use
+`--require-mnnvl` (=1) while debugging, so init fails loudly with the reason,
+and `--no-mnnvl` (=0) for a control run.
+
 ### Target versions
 
 Matching is by substring. Each can be overridden in the environment (on the

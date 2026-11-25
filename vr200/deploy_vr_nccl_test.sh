@@ -311,8 +311,10 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   bash run_vr_nccl_test.sh --max-size 8G   # shorter sweep (default 32G)
 #   bash run_vr_nccl_test.sh --hosts 10.0.0.1,10.0.0.2
 #   bash run_vr_nccl_test.sh --versions-warn # version mismatches are warnings, not failures
-#   bash run_vr_nccl_test.sh --require-mnnvl # fail instead of silently falling back
-#                                            # if multi-node NVLink is unavailable
+#   bash run_vr_nccl_test.sh --require-mnnvl # NCCL_MNNVL_ENABLE=1: NCCL init fails if multi-node
+#                                            # NVLink is unavailable (default 2 = auto, as GB300;
+#                                            # a silent fallback is still caught: multi-tray runs
+#                                            # fail if peak busbw < MIN_MNNVL_BUSBW, default 100 GB/s)
 #   bash run_vr_nccl_test.sh --allow-ib      # let NCCL use IB/RoCE between trays
 #   bash run_vr_nccl_test.sh --uuid 0x01     # set NCCL_MNNVL_UUID
 #   bash run_vr_nccl_test.sh --no-nvls       # NCCL_NVLS_ENABLE=0: skip NVLink-switch multicast
@@ -369,6 +371,9 @@ INFO=0
 DRY_RUN=0
 MAX_SIZE=""
 MNNVL_ENABLE=2      # 2 = auto (rack script default), 1 = required, 0 = off
+# Multi-tray runs with MNNVL on must reach this peak busbw (GB/s) at >= 64 MB,
+# else NCCL fell back to sockets (see the summary check)
+MIN_MNNVL_BUSBW="${MIN_MNNVL_BUSBW:-100}"
 IB_DISABLE=1
 NVLS_ENABLE=1
 MNNVL_UUID="${MNNVL_UUID:-}"
@@ -802,6 +807,24 @@ RC=0
 grep -aq "!!! " "$LOG" && RC=1
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1
 grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && RC=1
+
+# NCCL_MNNVL_ENABLE=2 (auto, the GB300 default) never fails when multi-node
+# NVLink is unavailable: NCCL quietly falls back to sockets over the bootstrap
+# NIC (~0.1 GB/s here vs ~1000+ GB/s over NVLink). So on multi-tray runs that
+# should use NVLink, a low peak busbw at large sizes is a FAIL, not a pass.
+if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
+  read -r PEAK BIGGEST <<< "$(awk '$1 ~ /^[0-9]+$/ && NF >= 9 && $8 ~ /^[0-9.]+$/ {
+      if ($8 > p) p = $8; if ($1 > s) s = $1 } END { print p+0, s+0 }' "$LOG")"
+  if (( BIGGEST >= 64 * 1024 * 1024 )); then
+    if awk -v p="$PEAK" -v m="$MIN_MNNVL_BUSBW" 'BEGIN { exit !(p < m) }'; then
+      echo "!!! peak busbw ${PEAK} GB/s < ${MIN_MNNVL_BUSBW} GB/s across ${NODES_REQUESTED} trays: NVLink between trays was NOT used"
+      echo "    (MNNVL auto fell back to sockets). Check IMEX/fabric, or re-run with --require-mnnvl --info to see why."
+      RC=1
+    else
+      echo "Peak busbw ${PEAK} GB/s across ${NODES_REQUESTED} trays (>= ${MIN_MNNVL_BUSBW}: NVLink between trays in use)"
+    fi
+  fi
+fi
 
 if [[ $INFO -eq 1 ]]; then
   # Which transport carried the traffic (from this node's ranks)
