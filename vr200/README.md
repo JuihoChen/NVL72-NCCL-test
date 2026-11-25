@@ -166,6 +166,16 @@ or more is below `MIN_MNNVL_BUSBW` (default 100 GB/s), or, with `--info`, if
 any `via NET/` transport shows up. `--mnnvl-auto` (=2, the GB300 default) and
 `--no-mnnvl` (=0, control run) are there for comparison.
 
+Why not 2 as on GB300: there, `=2` was the workaround for a driver/Fabric
+Manager bug (fixed in GB300 SW 1.0.1) where GPU-to-GFM inband messages were
+dropped (`knvlinkSendInbandData ... Failed to send inband data`), NVLS
+multicast setup failed, and `=1` exposed it as ~70x instead of ~920 GB/s. Auto
+hid the fault, which suits benchmarking but not a robustness test. So the
+runner also counts NVLink inband and Xid lines in dmesg on each tray before and
+after the run, and fails the run if any new ones appear. If VR200 shows that
+kind of drop with `=1`, that is a finding to report, and `--mnnvl-auto` gives
+the comparison number.
+
 ### Target versions
 
 Matching is by substring. Each can be overridden in the environment (on the

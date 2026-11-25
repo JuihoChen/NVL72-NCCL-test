@@ -378,6 +378,8 @@ MNNVL_ENABLE=""     # 1 = required (default on 2+ trays), 2 = auto (default on 1
 # Multi-tray runs with MNNVL on must reach this peak busbw (GB/s) at >= 64 MB,
 # else NVLink between trays was not (fully) used (see the summary check)
 MIN_MNNVL_BUSBW="${MIN_MNNVL_BUSBW:-100}"
+# Kernel log lines that mean the NVLink control path or a GPU had an error
+NVLINK_ERR_RE='Failed to send inband data|NVRM: Xid'  # same pattern in the remote pre-flight
 IB_DISABLE=1
 NVLS_ENABLE=1
 MNNVL_UUID="${MNNVL_UUID:-}"
@@ -629,6 +631,13 @@ if DM=$(dmesg 2>/dev/null || priv dmesg 2>/dev/null); then
   BW=$(echo "$DM" | grep -c "bwMode does not match" || true)
   [[ "$BW" -eq 0 ]] && ok "no NVLink bwMode mismatch in dmesg" \
     || bad "dmesg: $BW 'bwMode does not match' line(s) since boot -- cross-tray NVLink will fail; reboot the trays (README finding 4)"
+  # NVLink control-path errors (GB300: dropped GPU->GFM inband messages broke
+  # NVLS multicast setup and cost busbw). Counted again after the run.
+  NVERR=$(echo "$DM" | grep -cE "Failed to send inband data|NVRM: Xid" || true)
+  [[ "$NVERR" -eq 0 ]] && ok "no NVLink inband/Xid errors in dmesg" \
+    || warn "dmesg: $NVERR NVLink inband/Xid error line(s) since boot (any new ones during the run fail it)"
+else
+  NVERR="?"
 fi
 
 
@@ -654,13 +663,13 @@ grep -qxF 'pcompress_base_silence_warning = 1' "$HOME/.pmix/mca-params.conf" 2>/
 
 if [[ "$INFO" -eq 1 && "$DRY_RUN" -eq 0 ]]; then rm -rf /tmp/nccl_info && mkdir -p /tmp/nccl_info; fi
 
-echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$PSHA|$CUDA|$IMEX|$LINKS"
+echo "PREFLIGHT|$RC|$DRV|$NCCL|$FABRIC|$CLUSTER|$IFNAME|$IFCIDR|$PSHA|$CUDA|$IMEX|$LINKS|${NVERR:-?}"
 REMOTE
 
 MULTI=$(( NODES_REQUESTED > 1 ? 1 : 0 ))
 echo "=== Pre-flight on ${#RUN_NODES[@]} node(s)$([[ $DRY_RUN -eq 1 ]] && echo ' (dry run: check only)') ==="
 FAILED=()
-declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS
+declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS P_NVERR
 for ip in "${RUN_NODES[@]}"; do
   OUT=$(ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
           "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
@@ -670,7 +679,8 @@ for ip in "${RUN_NODES[@]}"; do
   echo "$OUT" | grep -v '^PREFLIGHT|'
   LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
   if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete"; continue; fi
-  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex links <<< "$LINE"
+  IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex links nverr <<< "$LINE"
+  P_NVERR[$ip]="$nverr"
   [[ "$rc" == "0" ]] || FAILED+=("$ip")
   P_DRV[$ip]="$drv"; P_NCCL[$ip]="$nccl"; P_CLUSTER[$ip]="$cluster"
   P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_SHA[$ip]="$psha"; P_NVLINKS[$ip]="$links"
@@ -831,6 +841,18 @@ if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
     fi
   fi
 fi
+
+# New NVLink inband/Xid kernel errors on any tray during the run fail it, even
+# when the numbers look fine: the test is about NVLink robustness.
+for ip in "${RUN_NODES[@]}"; do
+  [[ "${P_NVERR[$ip]:-?}" =~ ^[0-9]+$ ]] || continue
+  NOW=$(ssh "${SSH_OPTS[@]}" "$ip" "{ dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null; } | grep -cE '$NVLINK_ERR_RE'" 2>/dev/null) || true
+  [[ "$NOW" =~ ^[0-9]+$ ]] || continue
+  if (( NOW > P_NVERR[$ip] )); then
+    echo "!!! $ip: $(( NOW - P_NVERR[$ip] )) new NVLink inband/Xid error line(s) in dmesg during the run"
+    RC=1
+  fi
+done
 
 if [[ $INFO -eq 1 ]]; then
   # Which transport carried the traffic (from this node's ranks)
