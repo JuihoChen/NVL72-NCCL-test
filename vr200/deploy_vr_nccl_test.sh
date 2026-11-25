@@ -319,6 +319,8 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #    transport is seen)
 #   bash run_vr_nccl_test.sh --mnnvl-auto    # NCCL_MNNVL_ENABLE=2 (the GB300 default): may fall
 #                                            # back to sockets; the busbw floor still applies
+#   bash run_vr_nccl_test.sh --all-warnings  # also show the 2 known-harmless NCCL init WARNs per
+#                                            # rank (ibv_alloc_pd wrapper, RMA socket needs GDRCopy)
 #   bash run_vr_nccl_test.sh --allow-ib      # let NCCL use IB/RoCE between trays
 #   bash run_vr_nccl_test.sh --uuid 0x01     # set NCCL_MNNVL_UUID
 #   bash run_vr_nccl_test.sh --no-nvls       # NCCL_NVLS_ENABLE=0: skip NVLink-switch multicast
@@ -342,7 +344,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.10-vr"
+SCRIPT_VERSION="0.11-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -384,6 +386,7 @@ IB_DISABLE=1
 NVLS_ENABLE=1
 MNNVL_UUID="${MNNVL_UUID:-}"
 NODES_REQUESTED=""
+ALL_WARNINGS=0
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
@@ -396,6 +399,7 @@ while [[ $# -gt 0 ]]; do
     --max-size)      MAX_SIZE="$2"; shift 2 ;;
     --require-mnnvl) MNNVL_ENABLE=1; shift ;;
     --mnnvl-auto)    MNNVL_ENABLE=2; shift ;;
+    --all-warnings)  ALL_WARNINGS=1; shift ;;
     --allow-ib)      IB_DISABLE=0; shift ;;
     --no-nvls)       NVLS_ENABLE=0; shift ;;
     --no-mnnvl)      MNNVL_ENABLE=0; NVLS_ENABLE=0; shift ;;
@@ -805,6 +809,17 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit $PREFLIGHT_RC
 fi
 
+# NCCL 2.32 probes its internal RMA/GIN plugins at every comm init, even with
+# NCCL_IB_DISABLE=1 and no GDRCopy, and each rank prints two WARN lines that do
+# not affect the run (no NCCL setting skips that probe). They are hidden on the
+# console only, counted at the end, and kept in the log; --all-warnings shows them.
+KNOWN_WARN_RE='ibvwrap\.cc:[0-9]+ .*NCCL WARN lib wrapper not initialized|rma_socket\.cc:[0-9]+ .*NCCL WARN RMA/Socket : rma_socket requires GDRCopy'
+hide_known_warns() {
+  if [[ $ALL_WARNINGS -eq 1 ]]; then cat; return; fi
+  awk -v re="$KNOWN_WARN_RE" '$0 ~ re { n++; next } { print; fflush() }
+    END { if (n) printf "(%d known-harmless NCCL init WARN line(s) hidden: ibv_alloc_pd wrapper / RMA socket GDRCopy; see the log or --all-warnings)\n", n }'
+}
+
 {
   echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | pack nccl ${P_NCCL[$NODE00]:-?} cuda ${P_CUDA[$NODE00]:-?} sha ${P_SHA[$NODE00]:-?} | launch $(hostname)"
   run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}" \
@@ -812,7 +827,7 @@ fi
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
     || echo "!!! All-to-All exited with error $?"
   echo "$(date) : Done."
-} 2>&1 | tee "$LOG"
+} 2>&1 | tee "$LOG" | hide_known_warns
 
 # --- 4. Summary ------------------------------------------------------------
 echo ""
