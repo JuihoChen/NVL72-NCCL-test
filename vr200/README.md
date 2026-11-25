@@ -19,7 +19,8 @@ repo are untouched; everything VR200 lives in this folder.
 Only the GPU driver and IMEX come from the trays. Nothing on the trays is
 patched or installed, and the NCCL is NVIDIA's release build as is. The
 NCCL settings and mpirun flags match GB300 (`--mca schizo ompi`, ob1/tcp,
-MNNVL auto, NVLS on, IB off, `NCCL_P2P_SCHEDULE_GROUP_SIZE=1`).
+NVLS on, IB off, `NCCL_P2P_SCHEDULE_GROUP_SIZE=1`), except that MNNVL is
+required on multi-tray runs (see below).
 
 Identical hostnames on all trays are fine again: they only hung the system
 Open MPI 5 used during bring-up (finding 3), not the pack's Open MPI 4.
@@ -157,12 +158,13 @@ command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
 can supply them instead.)
 Logs and hostfiles go to `<data-dir>/run/results/`.
 
-`NCCL_MNNVL_ENABLE` stays at 2 (auto), as on GB300: NCCL uses NVLink between
-trays when IMEX and the fabric are healthy. The risk with auto is that it falls
-back to sockets silently, so a multi-tray run whose peak busbw at 64 MB or more
-is below `MIN_MNNVL_BUSBW` (default 100 GB/s) is marked FAIL. Use
-`--require-mnnvl` (=1) while debugging, so init fails loudly with the reason,
-and `--no-mnnvl` (=0) for a control run.
+The test is meant to prove NVLink robustness between trays, so multi-tray
+runs set `NCCL_MNNVL_ENABLE=1` (required): NCCL init fails instead of falling
+back to sockets. A single-tray run keeps 2 (auto), since it needs no NVLink
+between trays. A multi-tray run is also marked FAIL if its peak busbw at 64 MB
+or more is below `MIN_MNNVL_BUSBW` (default 100 GB/s), or, with `--info`, if
+any `via NET/` transport shows up. `--mnnvl-auto` (=2, the GB300 default) and
+`--no-mnnvl` (=0, control run) are there for comparison.
 
 ### Target versions
 

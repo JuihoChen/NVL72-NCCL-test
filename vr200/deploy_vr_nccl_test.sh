@@ -51,7 +51,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.3-vr"
+SCRIPT_VERSION="0.4-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -301,7 +301,9 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #     Only the GPU driver and IMEX come from the tray.
 #   - root (like GB300) or a normal user with passwordless SSH to every tray,
 #     itself included; repairs then go through "sudo -n"
-#   - same NCCL settings as GB300 (MNNVL auto, NVLS on, IB off)
+#   - NCCL settings as GB300 (NVLS on, IB off), except MNNVL is REQUIRED on
+#     multi-tray runs: the test is meant to prove NVLink between trays, so no
+#     silent fallback to sockets is allowed
 #
 # Run it ON NODE-00 (the first host in the list):
 #   bash run_vr_nccl_test.sh                 # all trays
@@ -311,10 +313,12 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   bash run_vr_nccl_test.sh --max-size 8G   # shorter sweep (default 32G)
 #   bash run_vr_nccl_test.sh --hosts 10.0.0.1,10.0.0.2
 #   bash run_vr_nccl_test.sh --versions-warn # version mismatches are warnings, not failures
-#   bash run_vr_nccl_test.sh --require-mnnvl # NCCL_MNNVL_ENABLE=1: NCCL init fails if multi-node
-#                                            # NVLink is unavailable (default 2 = auto, as GB300;
-#                                            # a silent fallback is still caught: multi-tray runs
-#                                            # fail if peak busbw < MIN_MNNVL_BUSBW, default 100 GB/s)
+#   (default on 2+ trays: NCCL_MNNVL_ENABLE=1, so NCCL init fails if NVLink between
+#    trays is unavailable; 1 tray: 2 = auto. Multi-tray runs also fail if peak busbw
+#    at >= 64 MB < MIN_MNNVL_BUSBW, default 100 GB/s, and with --info if any NET/
+#    transport is seen)
+#   bash run_vr_nccl_test.sh --mnnvl-auto    # NCCL_MNNVL_ENABLE=2 (the GB300 default): may fall
+#                                            # back to sockets; the busbw floor still applies
 #   bash run_vr_nccl_test.sh --allow-ib      # let NCCL use IB/RoCE between trays
 #   bash run_vr_nccl_test.sh --uuid 0x01     # set NCCL_MNNVL_UUID
 #   bash run_vr_nccl_test.sh --no-nvls       # NCCL_NVLS_ENABLE=0: skip NVLink-switch multicast
@@ -338,7 +342,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.9-vr"
+SCRIPT_VERSION="0.10-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -370,9 +374,9 @@ VERSIONS_WARN="${VERSIONS_WARN:-0}"
 INFO=0
 DRY_RUN=0
 MAX_SIZE=""
-MNNVL_ENABLE=2      # 2 = auto (rack script default), 1 = required, 0 = off
+MNNVL_ENABLE=""     # 1 = required (default on 2+ trays), 2 = auto (default on 1 tray), 0 = off
 # Multi-tray runs with MNNVL on must reach this peak busbw (GB/s) at >= 64 MB,
-# else NCCL fell back to sockets (see the summary check)
+# else NVLink between trays was not (fully) used (see the summary check)
 MIN_MNNVL_BUSBW="${MIN_MNNVL_BUSBW:-100}"
 IB_DISABLE=1
 NVLS_ENABLE=1
@@ -389,6 +393,7 @@ while [[ $# -gt 0 ]]; do
     --versions-warn) VERSIONS_WARN=1; shift ;;
     --max-size)      MAX_SIZE="$2"; shift 2 ;;
     --require-mnnvl) MNNVL_ENABLE=1; shift ;;
+    --mnnvl-auto)    MNNVL_ENABLE=2; shift ;;
     --allow-ib)      IB_DISABLE=0; shift ;;
     --no-nvls)       NVLS_ENABLE=0; shift ;;
     --no-mnnvl)      MNNVL_ENABLE=0; NVLS_ENABLE=0; shift ;;
@@ -402,7 +407,7 @@ done
 
 # Default sweep: 32G, but only 64M for --no-mnnvl (TCP over a ~1 Gb/s NIC
 # would take tens of minutes per size above that)
-MAX_SIZE="${MAX_SIZE:-$([[ $MNNVL_ENABLE -eq 0 ]] && echo 64M || echo 32G)}"
+MAX_SIZE="${MAX_SIZE:-$([[ $MNNVL_ENABLE == 0 ]] && echo 64M || echo 32G)}"
 
 if [[ -z "$HOSTS_RAW" ]]; then
   echo "ERROR: no hosts: pass --hosts ip1,ip2,... (tray 1 first) or stage with deploy_vr_nccl_test.sh" >&2
@@ -415,6 +420,8 @@ if ! [[ "$NODES_REQUESTED" =~ ^[0-9]+$ ]] || (( NODES_REQUESTED < 1 || NODES_REQ
   exit 1
 fi
 RUN_NODES=("${NODES[@]:0:$NODES_REQUESTED}")
+# NVLink robustness is the point of a multi-tray run, so MNNVL is required there
+[[ -z "$MNNVL_ENABLE" ]] && MNNVL_ENABLE=$(( NODES_REQUESTED > 1 ? 1 : 2 ))
 RUN_GPUS=$(( NODES_REQUESTED * GPUS_PER_NODE ))
 NODE00="${NODES[0]}"
 
@@ -808,17 +815,16 @@ grep -aq "!!! " "$LOG" && RC=1
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1
 grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && RC=1
 
-# NCCL_MNNVL_ENABLE=2 (auto, the GB300 default) never fails when multi-node
-# NVLink is unavailable: NCCL quietly falls back to sockets over the bootstrap
-# NIC (~0.1 GB/s here vs ~1000+ GB/s over NVLink). So on multi-tray runs that
-# should use NVLink, a low peak busbw at large sizes is a FAIL, not a pass.
+# With NCCL_MNNVL_ENABLE=1 NCCL init already fails without NVLink between trays.
+# The busbw floor also catches =2 (auto) quietly falling back to sockets over the
+# bootstrap NIC (~0.1 GB/s vs ~1000+ GB/s over NVLink) and a badly degraded fabric.
 if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
   read -r PEAK BIGGEST <<< "$(awk '$1 ~ /^[0-9]+$/ && NF >= 9 && $8 ~ /^[0-9.]+$/ {
       if ($8 > p) p = $8; if ($1 > s) s = $1 } END { print p+0, s+0 }' "$LOG")"
   if (( BIGGEST >= 64 * 1024 * 1024 )); then
     if awk -v p="$PEAK" -v m="$MIN_MNNVL_BUSBW" 'BEGIN { exit !(p < m) }'; then
       echo "!!! peak busbw ${PEAK} GB/s < ${MIN_MNNVL_BUSBW} GB/s across ${NODES_REQUESTED} trays: NVLink between trays was NOT used"
-      echo "    (MNNVL auto fell back to sockets). Check IMEX/fabric, or re-run with --require-mnnvl --info to see why."
+      echo "    Check IMEX/fabric/NVLink health, or re-run with --info to see the transports."
       RC=1
     else
       echo "Peak busbw ${PEAK} GB/s across ${NODES_REQUESTED} trays (>= ${MIN_MNNVL_BUSBW}: NVLink between trays in use)"
@@ -833,6 +839,10 @@ if [[ $INFO -eq 1 ]]; then
     | grep -oE "MNNVL[^ ]*|NVLS multicast support is (available|not available)|via (P2P/[A-Za-z]+|NET/[A-Za-z]+|SHM)" \
     | sort | uniq -c | sed 's/^/  /' || true
   echo "  (MNNVL / NVLS = NVLink between nodes; NET/Socket = TCP fallback; NET/IB = network)"
+  if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]] && cat /tmp/nccl_info/*.log 2>/dev/null | grep -aq "via NET/"; then
+    echo "!!! some NCCL traffic between trays went over the network (via NET/), not NVLink"
+    RC=1
+  fi
 fi
 echo "Log: $LOG"
 if [[ $RC -eq 0 ]]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
