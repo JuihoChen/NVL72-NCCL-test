@@ -130,8 +130,10 @@ picks it). Steps:
    into it, like GB300's generated `run_nccl_test.sh`. The runner is
    embedded in `deploy_vr_nccl_test.sh`, so the jumper needs only that one
    script and the pack tarball.
-4. `run_vr_nccl_test.sh --check` runs the full pre-flight on node-00; the
-   deploy exits non-zero if it fails (`--no-check` skips it).
+4. Like GB300, nothing runs on the trays after staging unless asked:
+   `--auto` runs the test on node-00 (pre-flight included), and `--check`
+   runs only the pre-flight (`run_vr_nccl_test.sh --check`). Otherwise the
+   deploy prints the command to run on node-00.
 
 `--user <name>` runs everything as a normal user instead of root (data dir
 `~/portable-nccl`, repairs through `sudo -n`).

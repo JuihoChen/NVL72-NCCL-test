@@ -15,10 +15,9 @@
 #         and verifies it from tray 1
 #   [3/4] stages run_vr_nccl_test.sh on node-00 with the rack settings
 #         (hosts, pack paths, UUID) injected, like GB300's run_nccl_test.sh
-#   [4/4] runs its pre-flight (run_vr_nccl_test.sh --check) on tray 1:
-#         driver / IMEX / pack versions, IMEX + channel0, fabric health,
-#         GPU P2P, pack binaries
-#   --auto then runs the test itself.
+#   [4/4] only with --auto (like GB300): runs the test on node-00, including its
+#         pre-flight. Without --auto nothing is run on the trays after staging;
+#         --check runs just the pre-flight (run_vr_nccl_test.sh --check) instead.
 #
 # Usage (tray 1 = the launch node = node-00):
 #   ./deploy_vr_nccl_test.sh rackNN.sh                  # CM_IPS from a GB300-style rack
@@ -39,7 +38,7 @@
 #   --uuid 0xNN          NCCL_MNNVL_UUID; default derived from the rack file
 #                        name like GB300 (rack17.sh -> 0x17), unset with --hosts
 #   --versions-warn      version mismatches in the pre-flight are warnings
-#   --no-check           skip step [4/4]
+#   --check              run only the pre-flight on node-00 after staging
 #
 # EXPECT_* variables set here (see the embedded run_vr_nccl_test.sh) are injected into
 # the staged script and so pinned for later runs.
@@ -51,7 +50,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.4-vr"
+SCRIPT_VERSION="0.5-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -68,7 +67,7 @@ BOOTSTRAP=0
 BOOTSTRAP_PASS=""
 AUTO=0
 DRY_RUN=0
-CHECK=1
+CHECK=0
 VERSIONS_WARN=0
 MNNVL_UUID=""
 RUN_ARGS=()
@@ -83,7 +82,8 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -gt 0 && "$1" != -* && "$1" != *.sh && "$1" != *.tar.gz ]]; then BOOTSTRAP_PASS="$1"; shift; fi ;;
     --auto)           AUTO=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
-    --no-check)       CHECK=0; shift ;;
+    --check)          CHECK=1; shift ;;
+    --no-check)       CHECK=0; shift ;;   # the default now; kept for old command lines
     --versions-warn)  VERSIONS_WARN=1; shift ;;
     --uuid)           MNNVL_UUID="$2"; shift 2 ;;
     --version)        echo "deploy_vr_nccl_test.sh version ${SCRIPT_VERSION}"; exit 0 ;;
@@ -885,10 +885,10 @@ else
   echo "    OK"
 fi
 
-# --- [4/4] pre-flight on tray 1 ------------------------------------------------
+# --- [4/4] only on request: --auto runs the test, --check only its pre-flight --
 RC=0
 if [[ $CHECK -eq 1 && $AUTO -eq 0 ]]; then
-  echo "--- [4/4] Pre-flight: run_vr_nccl_test.sh --check on node-00 ---"
+  echo "--- [4/4] --check: pre-flight only (run_vr_nccl_test.sh --check) on node-00 ---"
   if [[ $DRY_RUN -eq 1 ]]; then echo "[DRY-RUN] ssh ${RUN_USER}@${NODE00} bash ${RUN_DIR}/run_vr_nccl_test.sh --check"
   else ssh_to "$NODE00" bash "${RUN_DIR}/run_vr_nccl_test.sh" --check || RC=$?; fi
 fi
@@ -899,11 +899,23 @@ if [[ $RC -ne 0 ]]; then
 fi
 
 echo "=== Deploy complete: ${#NODES[@]} tray(s), node-00=${NODE00}, ${DATA_DIR} ==="
-echo "    run on node-00: bash ${RUN_DIR}/run_vr_nccl_test.sh [N] [--info] [--no-nvls] ..."
-echo "    or from here:   ssh ${RUN_USER}@${NODE00} bash ${RUN_DIR}/run_vr_nccl_test.sh"
+if [[ $AUTO -eq 0 ]]; then
+  cat <<MSG
+
+Next: ssh ${RUN_USER}@${NODE00} then 'bash ${RUN_DIR}/run_vr_nccl_test.sh'
+      (it re-checks/repairs IMEX + channel0 on every tray first, then runs)
+      (or re-run this script with --auto to have it run for you)
+
+        bash ${RUN_DIR}/run_vr_nccl_test.sh            # all ${#NODES[@]} trays
+        bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs)
+        bash ${RUN_DIR}/run_vr_nccl_test.sh --check    # pre-flight only, nothing changed
+        bash ${RUN_DIR}/run_vr_nccl_test.sh --info     # NCCL INFO -> /tmp/nccl_info/
+
+MSG
+fi
 
 if [[ $AUTO -eq 1 ]]; then
-  echo "--- --auto: running the test on node-00 ---"
+  echo "--- [4/4] --auto: running run_vr_nccl_test.sh on node-00 (includes pre-flight) ---"
   if [[ $DRY_RUN -eq 1 ]]; then echo "[DRY-RUN] ssh ${RUN_USER}@${NODE00} bash ${RUN_DIR}/run_vr_nccl_test.sh ${RUN_ARGS[*]}"
   else
     # -t: Ctrl-C on the jumper reaches mpirun on node-00
