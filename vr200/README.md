@@ -155,6 +155,14 @@ bash run_vr_nccl_test.sh --no-mnnvl     # control run: no NVLink between trays (
 bash run_vr_nccl_test.sh --max-size 8G
 ```
 
+Every rank prints two WARN lines at NCCL init that do not affect the run:
+`ibvwrap.cc ... lib wrapper not initialized` and `rma_socket.cc ... RMA/Socket :
+rma_socket requires GDRCopy`. NCCL 2.32.6 always probes its internal RMA/GIN
+IB and socket plugins at comm init, even with `NCCL_IB_DISABLE=1` and without
+GDRCopy, and has no setting that skips the probe. The runner hides exactly those
+two messages on the console and prints how many it hid. The log keeps them, and
+`--all-warnings` shows them. Any other NCCL WARN is shown as before.
+
 Settings: built-in defaults < the injected rack settings < environment <
 command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
 can supply them instead.)
