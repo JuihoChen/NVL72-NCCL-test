@@ -204,6 +204,26 @@ after the run, and fails the run if any new ones appear. If VR200 shows that
 kind of drop with `=1`, that is a finding to report, and `--mnnvl-auto` gives
 the comparison number.
 
+### GPU ranking (`--gpu-rank`)
+
+`bash run_vr_nccl_test.sh --gpu-rank` runs the normal test (All-Reduce,
+All-to-All) and then `nccl_pairwise_rank` (the GB300 `../gpu_rank/` tool), in
+one log with one RESULT that covers both. The ranking runs N-1 rounds, each
+GPU paired with every other, and prints every GPU slowest first with its worst
+partner. It uses the same pre-flight, network setup, NCCL settings (MNNVL
+required on 2+ trays) and pass/fail rules (new NVLink inband/Xid lines,
+`--info` transports) as the test. The pairwise matrix goes to
+`results/<time>_<N>node_gpu_rank_matrix.csv`. Options after `--` go to the
+tool, for example `--gpu-rank -- -b 2G -n 20`. The binary is built into the
+pack by `build_vr_pack.sh`, so a pack built before this needs one rebuild.
+The summary then has two blocks, each with its own PASS/FAIL: the NCCL test
+(both collectives and the peak-busbw check), printed right after all-to-all and
+before the ranking starts, and at the end the GPU rank (rack median,
+the slowest GPU with its % of the median, and the matrix path). The overall RESULT still covers both, plus the dmesg and `--info` checks.
+Only the ranking run gets `NCCL_COMM_ID`/`GPU_RANK_NODES`, so the NCCL test
+runs exactly as it does without `--gpu-rank`.
+`../gpu_rank/run_gpu_rank.sh` stays GB300-only.
+
 ### Target versions
 
 Matching is by substring. Each can be overridden in the environment (on the
