@@ -37,7 +37,9 @@
 #                        the trays then go through sudo -n)
 #   --uuid 0xNN          NCCL_MNNVL_UUID; default derived from the rack file
 #                        name like GB300 (rack17.sh -> 0x17), unset with --hosts
-#   --versions-warn      version mismatches in the pre-flight are warnings
+#   --versions-check     pin version checking ON in the staged runner: a tray or pack
+#                        version other than the target fails the pre-flight
+#   --versions-warn      pin version checking to WARN (default: off, like GB300)
 #   --check              run only the pre-flight on node-00 after staging
 #   --any-gpu            skip the check that every tray's GPU arch matches the pack
 #
@@ -73,7 +75,7 @@ ANY_GPU=0
 GB300_PACK=nccl-test-pack-arm64.tar.gz   # what ../deploy_rack_nccl_test.sh leaves in the data dir
 PACK_MARKER=.pack_extracted               # in the data dir: "pack <sha256>", then sha256sum of the key files
 PACK_KEY_FILES="bin/mpirun bin/orted bin/all_reduce_perf bin/alltoall_perf lib/libnccl.so.2 PACK_INFO"
-VERSIONS_WARN=0
+VERSIONS_CHECK=""
 MNNVL_UUID=""
 RUN_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -90,7 +92,8 @@ while [[ $# -gt 0 ]]; do
     --check)          CHECK=1; shift ;;
     --any-gpu)        ANY_GPU=1; shift ;;
     --no-check)       CHECK=0; shift ;;   # the default now; kept for old command lines
-    --versions-warn)  VERSIONS_WARN=1; shift ;;
+    --versions-warn)  VERSIONS_CHECK=warn; shift ;;
+    --versions-check) VERSIONS_CHECK=fail; shift ;;
     --uuid)           MNNVL_UUID="$2"; shift 2 ;;
     --version)        echo "deploy_vr_nccl_test.sh version ${SCRIPT_VERSION}"; exit 0 ;;
     -h|--help)        usage; exit 0 ;;
@@ -315,7 +318,7 @@ PACK_CACHE=\"\${PACK_CACHE:-$PACK_CACHE}\"
 RESULTS_DIR=\"\${RESULTS_DIR:-$RUN_DIR/results}\"
 "
 [[ -n "$MNNVL_UUID" ]] && CONF+="MNNVL_UUID=\"\${MNNVL_UUID:-$MNNVL_UUID}\""$'\n'
-[[ $VERSIONS_WARN -eq 1 ]] && CONF+="VERSIONS_WARN=\"\${VERSIONS_WARN:-1}\""$'\n'
+[[ -n "$VERSIONS_CHECK" ]] && CONF+="VERSIONS_CHECK=\"\${VERSIONS_CHECK:-$VERSIONS_CHECK}\""$'\n'
 for v in EXPECT_DRIVER EXPECT_CUDA EXPECT_NCCL EXPECT_NCCL_CUDA EXPECT_IMEX EXPECT_NVSHMEM EXPECT_DOCA; do
   # Only versions set on the jumper are pinned; otherwise the runner's defaults apply
   [[ -n "${!v+x}" ]] && CONF+="$v=\"\${$v-${!v}}\""$'\n'
@@ -349,7 +352,9 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   bash run_vr_nccl_test.sh --check         # pre-flight only (no repairs), print mpirun
 #   bash run_vr_nccl_test.sh --max-size 8G   # shorter sweep (default 32G)
 #   bash run_vr_nccl_test.sh --hosts 10.0.0.1,10.0.0.2
-#   bash run_vr_nccl_test.sh --versions-warn # version mismatches are warnings, not failures
+#   bash run_vr_nccl_test.sh --versions-check # versions other than the targets FAIL the pre-flight
+#   bash run_vr_nccl_test.sh --versions-warn  # ... are WARN lines (default: off, like GB300:
+#                                             # versions are printed, not judged)
 #   (default on 2+ trays: NCCL_MNNVL_ENABLE=1, so NCCL init fails if NVLink between
 #    trays is unavailable; 1 tray: 2 = auto. Multi-tray runs also fail if peak busbw
 #    at >= 64 MB < MIN_MNNVL_BUSBW, default 100 GB/s, and with --info if any NET/
@@ -373,15 +378,17 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   PACK_DIR     extracted pack (default /root/portable-nccl, or ~/portable-nccl)
 #   PACK_CACHE   the pack's tar.gz, re-extracted from if PACK_DIR is damaged
 #   RESULTS_DIR  (default PACK_DIR/run/results)
-#   Expected versions (substring match; set one to "" to skip that check):
-#   EXPECT_DRIVER 620.70.08 (tray)   EXPECT_IMEX 2.0.0 (tray)      -> [FAIL]
-#   EXPECT_NCCL 2.32.6 + EXPECT_NCCL_CUDA cuda13.5, EXPECT_CUDA 13.5.0
-#                (the pack's PACK_INFO)                             -> [FAIL]
-#   EXPECT_NVSHMEM 3.8.0, EXPECT_DOCA 3.3.3 (tray, informational)  -> [WARN]
+#   VERSIONS_CHECK off (default, like GB300) | warn | fail: what a version other than
+#   its target gives. off prints it as [INFO]; the driver user space / kernel
+#   check and the cross-tray "same stack" check apply in every mode.
+#   Target versions (substring match; set one to "" to skip it):
+#   EXPECT_DRIVER 620.70.08 (tray)   EXPECT_IMEX 2.0.0 (tray)
+#   EXPECT_NCCL 2.32.6 + EXPECT_NCCL_CUDA cuda13.5, EXPECT_CUDA 13.5.0 (the pack's PACK_INFO)
+#   EXPECT_NVSHMEM 3.8.0, EXPECT_DOCA 3.3.3 (tray; at most [WARN], even with fail)
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.12-vr"
+SCRIPT_VERSION="0.13-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -409,7 +416,7 @@ IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
 
 HOSTS_RAW="${HOSTS:-}"
-VERSIONS_WARN="${VERSIONS_WARN:-0}"
+VERSIONS_CHECK="${VERSIONS_CHECK:-$([[ "${VERSIONS_WARN:-0}" == 1 ]] && echo warn || echo off)}"
 INFO=0
 DRY_RUN=0
 MAX_SIZE=""
@@ -432,7 +439,8 @@ while [[ $# -gt 0 ]]; do
     --hosts)         HOSTS_RAW="$2"; shift 2 ;;
     --info)          INFO=1; shift ;;
     --dry-run|--check) DRY_RUN=1; shift ;;
-    --versions-warn) VERSIONS_WARN=1; shift ;;
+    --versions-warn) VERSIONS_CHECK=warn; shift ;;
+    --versions-check) VERSIONS_CHECK=fail; shift ;;
     --max-size)      MAX_SIZE="$2"; shift 2 ;;
     --require-mnnvl) MNNVL_ENABLE=1; shift ;;
     --mnnvl-auto)    MNNVL_ENABLE=2; shift ;;
@@ -518,7 +526,10 @@ RC=0
 ok()   { echo "  $TAG [OK]   $*"; }
 warn() { echo "  $TAG [WARN] $*"; }
 bad()  { echo "  $TAG [FAIL] $*"; RC=1; }
-vbad() { if [[ "$VWARN" -eq 1 ]]; then warn "$*"; else bad "$*"; fi; }   # version mismatch
+info() { echo "  $TAG [INFO] $*"; }
+# A version other than its target: [INFO] (check off), [WARN] or [FAIL]
+vbad()  { case "$VWARN" in fail) bad "$*" ;; warn) warn "$*" ;; *) info "$* (version check off)" ;; esac; }
+vwarn() { case "$VWARN" in fail|warn) warn "$*" ;; *) info "$* (version check off)" ;; esac; }
 priv() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo -n "$@"; fi; }
 # installed dpkg packages matching an ERE on the package name: "<pkg> <version>" lines
 pkgs() { dpkg-query -W -f='${db:Status-Abbrev}|${Package} ${Version}\n' 2>/dev/null \
@@ -564,15 +575,15 @@ IMEX=$(pkgs '^nvidia-imex' | head -1); IMEX="${IMEX:-none}"
 IMEX_V=$(nvidia-imex --version 2>/dev/null | head -3 | xargs)
 if [[ -z "$EXPECT_IMEX" || "$IMEX $IMEX_V" == *"$EXPECT_IMEX"* ]]; then ok "IMEX $IMEX${IMEX_V:+ ($IMEX_V)}"
 elif [[ "$MULTI" -eq 1 ]]; then vbad "IMEX is '$IMEX${IMEX_V:+ / $IMEX_V}', expected $EXPECT_IMEX"
-else warn "IMEX is '$IMEX${IMEX_V:+ / $IMEX_V}', expected $EXPECT_IMEX (not used by a 1-tray run)"; fi
+else vwarn "IMEX is '$IMEX${IMEX_V:+ / $IMEX_V}', expected $EXPECT_IMEX (not used by a 1-tray run)"; fi
 
 # Informational: not used by nccl-tests, reported so the stack is on record
 NVSHMEM=$(pkgs '^(lib)?nvshmem' | head -1); NVSHMEM="${NVSHMEM:-none}"
 if [[ -z "$EXPECT_NVSHMEM" || "$NVSHMEM" == *"$EXPECT_NVSHMEM"* ]]; then ok "NVSHMEM $NVSHMEM"
-else warn "NVSHMEM is '$NVSHMEM', expected $EXPECT_NVSHMEM"; fi
+else vwarn "NVSHMEM is '$NVSHMEM', expected $EXPECT_NVSHMEM"; fi
 DOCA=$(pkgs '^doca-host$' | head -1); [[ -n "$DOCA" ]] || DOCA=$(pkgs '^doca-' | head -1); DOCA="${DOCA:-none}"
 if [[ -z "$EXPECT_DOCA" || "$DOCA" == *"$EXPECT_DOCA"* ]]; then ok "DOCA $DOCA"
-else warn "DOCA is '$DOCA', expected DOCA_Host $EXPECT_DOCA"; fi
+else vwarn "DOCA is '$DOCA', expected DOCA_Host $EXPECT_DOCA"; fi
 
 # Pack binaries: every library resolves (pack lib/ + the tray's base OS and
 # driver), and MPI / NCCL come from the pack, not from the tray
@@ -716,7 +727,7 @@ for ip in "${RUN_NODES[@]}"; do
           "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
           "$IMEX_CFG" "$HOSTS_RAW" "$DRY_RUN" "$INFO" "$MULTI" "$ip" \
           "$EXPECT_CUDA" "$EXPECT_NCCL_CUDA" "$EXPECT_IMEX" "$EXPECT_NVSHMEM" "$EXPECT_DOCA" \
-          "$VERSIONS_WARN" <<< "$REMOTE_PREFLIGHT" 2>&1) || true
+          "$VERSIONS_CHECK" <<< "$REMOTE_PREFLIGHT" 2>&1) || true
   echo "$OUT" | grep -v '^PREFLIGHT|'
   LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
   if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete"; continue; fi

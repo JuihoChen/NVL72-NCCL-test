@@ -208,10 +208,15 @@ the comparison number.
 
 Matching is by substring. Each can be overridden in the environment (on the
 jumper it is then injected into the staged script); `""` skips that check.
-`--versions-warn` (either script) turns FAIL into WARN, to try a newer drop.
-All trays must also agree with each other on driver, IMEX and pack.
+Like GB300, versions are **not judged by default**: a version other than its
+target is printed as `[INFO] ... (version check off)` and the run goes ahead.
+`--versions-warn` makes those lines WARN, and `--versions-check` makes them
+FAIL the pre-flight (the "Checked" column). Pass either to the deploy to pin it
+in the staged runner, or to `run_vr_nccl_test.sh` for one run. In every mode the
+driver user space must match the kernel module, and all trays must agree with
+each other on driver, IMEX and pack.
 
-| Component | Where | Variable | Default | Mismatch |
+| Component | Where | Variable | Target | Checked |
 |---|---|---|---|---|
 | Driver, user space = kernel module | tray | `EXPECT_DRIVER` | `620.70.08` | FAIL |
 | IMEX (`nvidia-imex*` package / `--version`) | tray | `EXPECT_IMEX` | `2.0.0` | FAIL on multi-tray runs |
