@@ -1027,8 +1027,6 @@ if [[ $GPU_RANK -eq 1 ]]; then
   grep -a "^rack median score" "$LOG" | tail -1 || true
   awk '/^=== GPU ranking/ { f = 1 } f && $1 == "1" && $2 ~ /^[0-9]+$/ && NF >= 7 {
          printf "slowest GPU: rank %s %s %s, score %s GB/s (%s of median)\n", $2, $3, $4, $5, $6
-         v = $6; sub(/%/, "", v)
-         if (v + 0 < 95) print "    below 95% of the median: check this GPU (and the partners listed for it in the table)"
          exit }' "$LOG"
   if [[ -s "$RANK_CSV" ]]; then echo "pairwise matrix (GB/s): $RANK_CSV"
   else echo "!!! GPU rank wrote no matrix ($RANK_CSV)"; RANK_RC=1; fi
