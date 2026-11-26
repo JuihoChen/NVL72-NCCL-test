@@ -53,7 +53,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.8-vr"
+SCRIPT_VERSION="0.9-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -109,7 +109,13 @@ done
 if [[ -z "$PACK" ]]; then PACK="$SCRIPT_DIR/$DEFAULT_PACK_NAME"
 elif [[ ! -f "$PACK" ]]; then PACK="$SCRIPT_DIR/$PACK"; fi
 [[ -f "$PACK" ]] || { echo "ERROR: pack not found: $PACK (build it with pack/build_vr_pack.sh)" >&2; exit 1; }
-PACK_INFO=$(tar -xzOf "$PACK" ./PACK_INFO 2>/dev/null || tar -xzOf "$PACK" PACK_INFO 2>/dev/null || true)
+# Reading the pack takes a few seconds for 200+ MB, so say so first. PACK_INFO:
+# try the name build_vr_pack.sh uses first (one gunzip pass, not two);
+# --occurrence=1 stops reading at it, which is at once for packs from
+# build_vr_pack.sh 1.1-vr+ (PACK_INFO first in the tarball).
+echo "Reading $(basename "$PACK") ($(du -h "$PACK" | cut -f1)): PACK_INFO + sha256 ..."
+PACK_INFO=$(tar -xzOf "$PACK" --occurrence=1 PACK_INFO 2>/dev/null \
+            || tar -xzOf "$PACK" --occurrence=1 ./PACK_INFO 2>/dev/null || true)
 [[ -n "$PACK_INFO" ]] || { echo "ERROR: $PACK has no PACK_INFO -- not a VR200 pack from pack/build_vr_pack.sh?" >&2; exit 1; }
 PACK_SHA=$(sha256sum "$PACK" | cut -d' ' -f1)
 PACK_BASENAME=$(basename "$PACK")
