@@ -135,6 +135,24 @@ picks it). Steps:
    runs only the pre-flight (`run_vr_nccl_test.sh --check`). Otherwise the
    deploy prints the command to run on node-00.
 
+**Same rack, either script.** Both deploys use `/root/portable-nccl` and both
+packs put `bin/ lib/ share/` at its top, so each deploy now deletes those
+before extracting, plus the other script's leftovers. This deploy also
+removes a GB300 `run/run_nccl_test.sh` and `nccl-test-pack-arm64.tar.gz`.
+GB300's deploy (0.25 and later) also removes `PACK_INFO`, `PACK_LIBS` and
+`run/run_vr_nccl_test.sh`. Before changing anything, this deploy also checks
+that every tray's GPU arch matches the pack (`gencode` in `PACK_INFO`, sm_107
+on VR200), so on a GB300 rack (10.3) it stops at step [0/4]. `--any-gpu`
+skips that check.
+
+A redeploy of the same pack skips the extract when nothing changed: after
+extracting, the deploy writes `.pack_extracted` in the data dir with the
+pack's sha256 and the sha256 of `bin/mpirun`, `bin/orted`, the two `*_perf`
+binaries, `lib/libnccl.so.2` and `PACK_INFO`. If the pack is the same and
+those files still match, the tray is left as it is. Otherwise (a new pack, an
+interrupted extract, another deploy over it) the old folders are deleted and
+the pack extracted again. The GB300 deploy deletes the marker too.
+
 `--user <name>` runs everything as a normal user instead of root (data dir
 `~/portable-nccl`, repairs through `sudo -n`).
 
@@ -190,10 +208,17 @@ the comparison number.
 
 Matching is by substring. Each can be overridden in the environment (on the
 jumper it is then injected into the staged script); `""` skips that check.
-`--versions-warn` (either script) turns FAIL into WARN, to try a newer drop.
-All trays must also agree with each other on driver, IMEX and pack.
+Like GB300, versions are **not checked by default**: the pre-flight only
+reports what each tray and the pack have (driver, NCCL, CUDA runtime, IMEX,
+NVSHMEM, DOCA) as `[INFO]` lines, with no comparison to the targets below. NVIDIA
+ships minor releases often, so pinned targets would go stale. `--versions-warn`
+compares them and gives WARN for a mismatch; `--versions-check` gives FAIL (the
+"Checked" column). Pass either to the deploy to pin it
+in the staged runner, or to `run_vr_nccl_test.sh` for one run. In every mode the
+driver user space must match the kernel module, and all trays must agree with
+each other on driver, IMEX and pack.
 
-| Component | Where | Variable | Default | Mismatch |
+| Component | Where | Variable | Target | Checked |
 |---|---|---|---|---|
 | Driver, user space = kernel module | tray | `EXPECT_DRIVER` | `620.70.08` | FAIL |
 | IMEX (`nvidia-imex*` package / `--version`) | tray | `EXPECT_IMEX` | `2.0.0` | FAIL on multi-tray runs |
@@ -203,6 +228,12 @@ All trays must also agree with each other on driver, IMEX and pack.
 | DOCA Host (`doca-host` package) | tray | `EXPECT_DOCA` | `3.3.3` | WARN |
 
 ### Pre-flight checks (per tray, over SSH)
+
+The console shows one line per check for the whole rack: FAIL and WARN first,
+then the rest. A line that is the same on every tray says `(all 18 trays)`;
+otherwise it names the trays (`n00-n05 n07-n17`, or `n06/192.168.101.143` for a
+problem on a few trays). Every tray's full pre-flight is saved as
+`results/<time>_preflight.log`, and `--verbose` prints it on the console instead.
 
 - versions (table above); driver user space **and** kernel module must
   agree (finding 1); `nvidia-smi` works, 4 GPUs visible
