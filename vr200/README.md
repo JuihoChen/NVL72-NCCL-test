@@ -206,8 +206,9 @@ the comparison number.
 
 ### GPU ranking (`--gpu-rank`)
 
-`bash run_vr_nccl_test.sh --gpu-rank` runs `nccl_pairwise_rank` (the GB300
-`../gpu_rank/` tool) instead of the nccl-tests sweep. It runs N-1 rounds, each
+`bash run_vr_nccl_test.sh --gpu-rank` runs the normal test (All-Reduce,
+All-to-All) and then `nccl_pairwise_rank` (the GB300 `../gpu_rank/` tool), in
+one log with one RESULT that covers both. The ranking runs N-1 rounds, each
 GPU paired with every other, and prints every GPU slowest first with its worst
 partner. It uses the same pre-flight, network setup, NCCL settings (MNNVL
 required on 2+ trays) and pass/fail rules (new NVLink inband/Xid lines,
