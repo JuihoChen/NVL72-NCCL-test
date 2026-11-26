@@ -229,6 +229,12 @@ each other on driver, IMEX and pack.
 
 ### Pre-flight checks (per tray, over SSH)
 
+The console shows one line per check for the whole rack: FAIL and WARN first,
+then the rest. A line that is the same on every tray says `(all 18 trays)`;
+otherwise it names the trays (`n00-n05 n07-n17`, or `n06/192.168.101.143` for a
+problem on a few trays). Every tray's full pre-flight is saved as
+`results/<time>_preflight.log`, and `--verbose` prints it on the console instead.
+
 - versions (table above); driver user space **and** kernel module must
   agree (finding 1); `nvidia-smi` works, 4 GPUs visible
 - pack complete (else re-extracted from the cache); `*_perf`, `mpirun`,

@@ -361,6 +361,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #    transport is seen)
 #   bash run_vr_nccl_test.sh --mnnvl-auto    # NCCL_MNNVL_ENABLE=2 (the GB300 default): may fall
 #                                            # back to sockets; the busbw floor still applies
+#   bash run_vr_nccl_test.sh --verbose       # pre-flight: every check of every tray, not grouped
 #   bash run_vr_nccl_test.sh --all-warnings  # also show the 2 known-harmless NCCL init WARNs per
 #                                            # rank (ibv_alloc_pd wrapper, RMA socket needs GDRCopy)
 #   bash run_vr_nccl_test.sh --allow-ib      # let NCCL use IB/RoCE between trays
@@ -389,7 +390,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.13-vr"
+SCRIPT_VERSION="0.14-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -432,6 +433,7 @@ NVLS_ENABLE=1
 MNNVL_UUID="${MNNVL_UUID:-}"
 NODES_REQUESTED=""
 ALL_WARNINGS=0
+VERBOSE=0
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
@@ -446,6 +448,7 @@ while [[ $# -gt 0 ]]; do
     --require-mnnvl) MNNVL_ENABLE=1; shift ;;
     --mnnvl-auto)    MNNVL_ENABLE=2; shift ;;
     --all-warnings)  ALL_WARNINGS=1; shift ;;
+    --verbose)       VERBOSE=1; shift ;;
     --allow-ib)      IB_DISABLE=0; shift ;;
     --no-nvls)       NVLS_ENABLE=0; shift ;;
     --no-mnnvl)      MNNVL_ENABLE=0; NVLS_ENABLE=0; shift ;;
@@ -731,6 +734,11 @@ REMOTE
 MULTI=$(( NODES_REQUESTED > 1 ? 1 : 0 ))
 echo "=== Pre-flight on ${#RUN_NODES[@]} node(s)$([[ $DRY_RUN -eq 1 ]] && echo ' (dry run: check only)') ==="
 FAILED=()
+# Every tray's full pre-flight goes to PF_LOG; the console groups identical lines
+# (one line per check for the whole rack, naming only the trays that differ)
+mkdir -p "$RESULTS_DIR"
+PF_LOG="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_preflight.log"
+: > "$PF_LOG"
 declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS P_NVERR
 for ip in "${RUN_NODES[@]}"; do
   OUT=$(ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
@@ -738,9 +746,10 @@ for ip in "${RUN_NODES[@]}"; do
           "$IMEX_CFG" "$HOSTS_RAW" "$DRY_RUN" "$INFO" "$MULTI" "$ip" \
           "$EXPECT_CUDA" "$EXPECT_NCCL_CUDA" "$EXPECT_IMEX" "$EXPECT_NVSHMEM" "$EXPECT_DOCA" \
           "$VERSIONS_CHECK" <<< "$REMOTE_PREFLIGHT" 2>&1) || true
-  echo "$OUT" | grep -v '^PREFLIGHT|'
+  echo "$OUT" | grep -v '^PREFLIGHT|' >> "$PF_LOG"
+  [[ $VERBOSE -eq 1 ]] && echo "$OUT" | grep -v '^PREFLIGHT|'
   LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
-  if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete"; continue; fi
+  if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete" | tee -a "$PF_LOG"; continue; fi
   IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex links nverr <<< "$LINE"
   P_NVERR[$ip]="$nverr"
   [[ "$rc" == "0" ]] || FAILED+=("$ip")
@@ -748,6 +757,50 @@ for ip in "${RUN_NODES[@]}"; do
   P_IF[$ip]="$ifname"; P_CIDR[$ip]="$ifcidr"; P_SHA[$ip]="$psha"; P_NVLINKS[$ip]="$links"
   P_CUDA[$ip]="$cuda"; P_IMEX[$ip]="$imex"
 done
+
+# One line per distinct check result: FAIL and WARN first, then the rest. A line
+# seen on every tray says "all N trays"; otherwise it names the trays (n00-n03 n07).
+[[ $VERBOSE -eq 1 ]] || awk -v N="${#RUN_NODES[@]}" '
+  function rng(list,   a, n, i, out, s, p, v) {
+    n = split(list, a, " "); out = ""; s = p = -1
+    for (i = 1; i <= n + 1; i++) {
+      v = (i <= n) ? a[i] + 0 : -2
+      if (s >= 0 && v == p + 1) { p = v; continue }
+      if (s >= 0) out = out (out ? " " : "") (s == p ? sprintf("n%02d", s) : sprintf("n%02d-n%02d", s, p))
+      s = p = v
+    }
+    return out
+  }
+  match($0, /^  \[n[0-9]+\/[^]]*\] \[(OK|INFO|WARN|FAIL)\] */) {
+    tag = substr($0, 5, index($0, "/") - 5)          # "00" from "  [n00/ip]"
+    ip[tag + 0] = substr($0, index($0, "/") + 1, index($0, "]") - index($0, "/") - 1)
+    rest = substr($0, RLENGTH + 1)
+    lvl = substr($0, index($0, "] [") + 3); lvl = substr(lvl, 1, index(lvl, "]") - 1)
+    if (rest ~ /^bootstrap interface /) rest = "bootstrap interface found (names and IPs in the log)"
+    k = lvl SUBSEP rest
+    if (!(k in cnt)) { order[++nk] = k }
+    cnt[k]++; who[k] = who[k] " " tag
+    next
+  }
+  { other[++no] = $0 }
+  function ips(list,   a, n, i, out) {                # problems: name each tray with its IP
+    n = split(list, a, " "); out = ""
+    for (i = 1; i <= n; i++) out = out (i > 1 ? " " : "") sprintf("n%02d/%s", a[i], ip[a[i] + 0])
+    return out
+  }
+  END {
+    for (pass = 1; pass <= 3; pass++)                   # FAIL, then WARN, then the rest
+      for (i = 1; i <= nk; i++) {
+        split(order[i], kv, SUBSEP)
+        if (pass != (kv[1] == "FAIL" ? 1 : kv[1] == "WARN" ? 2 : 3)) continue
+        l = substr(who[order[i]], 2)
+        where = (cnt[order[i]] == N) ? (N > 2 ? "all " N " trays" : N == 2 ? "both trays" : "") \
+              : (pass < 3 && cnt[order[i]] <= 6) ? ips(l) : rng(l)
+        printf "  [%s]%s %s%s\n", kv[1], substr("   ", 1, 4 - length(kv[1])), kv[2], (where ? "  (" where ")" : "")
+      }
+    for (i = 1; i <= no; i++) print other[i]
+  }' "$PF_LOG"
+echo "  (every tray's full pre-flight: $PF_LOG; --verbose prints it here)"
 
 # All nodes must run the identical stack
 if [[ ${#RUN_NODES[@]} -gt 1 ]]; then
@@ -805,7 +858,9 @@ if [[ -z "$MPI_NET" || -z "$NCCL_IFS" ]]; then
   echo "ERROR: could not determine the bootstrap network from pre-flight" >&2
   exit 1
 fi
-for ip in "${RUN_NODES[@]}"; do echo "Bootstrap: $ip -> ${P_IF[$ip]:-?} (${P_CIDR[$ip]:-?})"; done
+for ip in "${RUN_NODES[@]}"; do echo "Bootstrap: $ip -> ${P_IF[$ip]:-?} (${P_CIDR[$ip]:-?})"; done >> "$PF_LOG"
+if [[ ${#RUN_NODES[@]} -le 4 || $VERBOSE -eq 1 ]]; then grep '^Bootstrap: ' "$PF_LOG"
+else echo "Bootstrap: ${#RUN_NODES[@]} trays, one interface each (names and IPs in $PF_LOG)"; fi
 echo "MPI network: $MPI_NET | NCCL_SOCKET_IFNAME: $NCCL_IFS"
 
 LOG="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_${NODES_REQUESTED}node.log"
