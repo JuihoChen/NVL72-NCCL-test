@@ -24,6 +24,10 @@
 #     an existing checkout/build there is not touched
 #   - the GPU architecture for nccl-tests comes from this tray's GPUs
 #     (nvidia-smi compute_cap), e.g. Rubin, unless NVCC_GENCODE is given
+#   - nccl_pairwise_rank (the GPU ranking tool, ../../gpu_rank/) is compiled
+#     into bin/ with gcc, so run_vr_nccl_test.sh --gpu-rank needs nothing else.
+#     Source: --rank-src <file>, else ../../gpu_rank/nccl_pairwise_rank.c next
+#     to this script, else downloaded from RANK_SRC_URL
 #   - a 4-GPU smoke run of the finished pack (its own mpirun) checks it
 #
 #   bash build_vr_pack.sh                         # work dir ~/vr-pack-build
@@ -58,6 +62,8 @@ NCCL_VERSION="${NCCL_VERSION:-2.32.6-1+cuda13.5}"
 NCCL_REPO_URLS="${NCCL_REPO_URLS:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/sbsa https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa}"
 NCCL_DEBS=""
 NCCL_SOURCE=0
+RANK_SRC=""
+RANK_SRC_URL="${RANK_SRC_URL:-https://raw.githubusercontent.com/JuihoChen/NVL72-NCCL-test/main/gpu_rank/nccl_pairwise_rank.c}"
 OMPI_VERSION="${OMPI_VERSION:-4.1.6}"
 
 while [[ $# -gt 0 ]]; do
@@ -72,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --nccl-source)     NCCL_SOURCE=1; shift ;;
     --no-smoke)        SMOKE=0; shift ;;
     --clean)           CLEAN=1; shift ;;
+    --rank-src)        RANK_SRC="$2"; shift 2 ;;
     -h|--help)         awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *)                 echo "ERROR: unknown argument: $1 (see --help)" >&2; exit 1 ;;
   esac
@@ -237,6 +244,26 @@ make -C "$WORK/nccl-tests" -j"$JOBS" "${MK[@]}" > "$WORK/nccl_tests_build.log" 2
 cp "$WORK"/nccl-tests/build/*_perf "$PACK/bin/"
 echo "  $(ls "$WORK"/nccl-tests/build/*_perf | wc -l) *_perf binaries -> $PACK/bin"
 
+# --- 3b. nccl_pairwise_rank (GPU ranking; dlopen()s NCCL + cudart, no headers) ----
+step "nccl_pairwise_rank (run_vr_nccl_test.sh --gpu-rank)"
+if [[ -z "$RANK_SRC" ]]; then
+  RANK_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../gpu_rank/nccl_pairwise_rank.c"
+  if [[ ! -f "$RANK_SRC" ]]; then
+    RANK_SRC="$WORK/nccl_pairwise_rank.c"
+    echo "  downloading $RANK_SRC_URL"
+    { command -v wget >/dev/null && wget -q -O "$RANK_SRC.part" "$RANK_SRC_URL"; } || curl -fsSL -o "$RANK_SRC.part" "$RANK_SRC_URL" \
+      || die "nccl_pairwise_rank.c not found: pass --rank-src <file> (it is gpu_rank/nccl_pairwise_rank.c in the repo)"
+    mv "$RANK_SRC.part" "$RANK_SRC"
+  fi
+fi
+[[ -f "$RANK_SRC" ]] || die "--rank-src $RANK_SRC: no such file"
+gcc -O2 -std=gnu11 -o "$PACK/bin/nccl_pairwise_rank" "$RANK_SRC" -ldl \
+  || die "nccl_pairwise_rank build failed ($RANK_SRC)"
+"$PACK/bin/nccl_pairwise_rank" --selftest 8 3 0.7 > "$WORK/gpu_rank_selftest.log" 2>&1 \
+  || { cat "$WORK/gpu_rank_selftest.log"; die "nccl_pairwise_rank --selftest failed"; }
+RANK_DESC="$(sha256sum "$RANK_SRC" | cut -c1-12)"
+echo "  built from $RANK_SRC (sha256 $RANK_DESC); selftest OK"
+
 # --- 4. libraries + PACK_INFO ------------------------------------------------------
 step "Assembling lib/ and PACK_INFO"
 rm -f "$PACK"/lib/libnccl.so* "$PACK"/lib/libcudart.so*
@@ -311,6 +338,7 @@ cuda=${CUDA_V}
 cudart=$(basename "$(readlink -f lib/libcudart.so.[0-9]*)")
 openmpi=${OMPI_VERSION} (--without-slurm)
 nccl_tests=${TESTS_REF}
+gpu_rank=nccl_pairwise_rank (source sha256 ${RANK_DESC:-none})
 gencode=${NVCC_GENCODE:-default}
 built_on=$(hostname) $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") $(uname -r)
 glibc=$(ldd --version | head -1 | awk '{print $NF}')
@@ -319,7 +347,7 @@ cat PACK_INFO
 echo "lib/: $(ls lib | wc -l) entries, bin/: $(ls bin | wc -l) entries, $(du -sh . | cut -f1)"
 ASSEMBLE
 )
-CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" NCCL_DIR="$NCCL_DIR" \
+CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" NCCL_DIR="$NCCL_DIR" RANK_DESC="$RANK_DESC" \
   NCCL_INFO="$(cat "$NCCL_DIR/VERSION")" NCCL_VERSION="$NCCL_VERSION" \
   bash -c "$ASSEMBLE_SH" assemble "$PACK" "$TESTS_DESC" "$OMPI_VERSION"
 

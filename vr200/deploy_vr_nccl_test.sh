@@ -53,7 +53,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.7-vr"
+SCRIPT_VERSION="0.8-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -361,6 +361,11 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #    transport is seen)
 #   bash run_vr_nccl_test.sh --mnnvl-auto    # NCCL_MNNVL_ENABLE=2 (the GB300 default): may fall
 #                                            # back to sockets; the busbw floor still applies
+#   bash run_vr_nccl_test.sh --gpu-rank      # rank every GPU by NCCL point-to-point bandwidth
+#                                            # (nccl_pairwise_rank from the pack, ../gpu_rank),
+#                                            # slowest first, instead of the nccl-tests sweep.
+#                                            # Same pre-flight, network and NCCL settings.
+#   bash run_vr_nccl_test.sh --gpu-rank -- -b 2G -n 20   # options for nccl_pairwise_rank
 #   bash run_vr_nccl_test.sh --verbose       # pre-flight: every check of every tray, not grouped
 #   bash run_vr_nccl_test.sh --all-warnings  # also show the 2 known-harmless NCCL init WARNs per
 #                                            # rank (ibv_alloc_pd wrapper, RMA socket needs GDRCopy)
@@ -390,7 +395,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.14-vr"
+SCRIPT_VERSION="0.15-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -434,6 +439,8 @@ MNNVL_UUID="${MNNVL_UUID:-}"
 NODES_REQUESTED=""
 ALL_WARNINGS=0
 VERBOSE=0
+GPU_RANK=0
+RANK_ARGS=()
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
@@ -449,6 +456,8 @@ while [[ $# -gt 0 ]]; do
     --mnnvl-auto)    MNNVL_ENABLE=2; shift ;;
     --all-warnings)  ALL_WARNINGS=1; shift ;;
     --verbose)       VERBOSE=1; shift ;;
+    --gpu-rank)      GPU_RANK=1; shift ;;
+    --)              shift; RANK_ARGS=("$@"); break ;;
     --allow-ib)      IB_DISABLE=0; shift ;;
     --no-nvls)       NVLS_ENABLE=0; shift ;;
     --no-mnnvl)      MNNVL_ENABLE=0; NVLS_ENABLE=0; shift ;;
@@ -708,14 +717,14 @@ fi
 
 # Stale test processes from an aborted run ("CUDA-capable device(s) is/are busy")
 PIDS=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
-  | grep -E 'all_reduce_perf|alltoall_perf|orted|mpirun' | awk -F, '{print $1}' | xargs)
+  | grep -E 'all_reduce_perf|alltoall_perf|nccl_pairwise_rank|orted|mpirun' | awk -F, '{print $1}' | xargs)
 if [[ -n "$PIDS" ]]; then
   if [[ "$DRY_RUN" -eq 1 ]]; then warn "stale test processes on GPU: $PIDS (would kill)"
   else
     kill -9 $PIDS 2>/dev/null || priv kill -9 $PIDS 2>/dev/null || true
     sleep 2
     if nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>/dev/null \
-        | grep -qE 'all_reduce_perf|alltoall_perf|orted|mpirun'; then
+        | grep -qE 'all_reduce_perf|alltoall_perf|nccl_pairwise_rank|orted|mpirun'; then
       bad "stale test processes survived kill -9 -- check dmesg for Xid"
     else ok "cleared stale processes: $PIDS"; fi
   fi
@@ -863,7 +872,9 @@ if [[ ${#RUN_NODES[@]} -le 4 || $VERBOSE -eq 1 ]]; then grep '^Bootstrap: ' "$PF
 else echo "Bootstrap: ${#RUN_NODES[@]} trays, one interface each (names and IPs in $PF_LOG)"; fi
 echo "MPI network: $MPI_NET | NCCL_SOCKET_IFNAME: $NCCL_IFS"
 
-LOG="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_${NODES_REQUESTED}node.log"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_KIND=""; [[ $GPU_RANK -eq 1 ]] && LOG_KIND=_gpu_rank
+LOG="${RESULTS_DIR}/${STAMP}_${NODES_REQUESTED}node${LOG_KIND}.log"
 NCCL_ENV=(
   "NCCL_SOCKET_IFNAME=${NCCL_IFS}"
   "NCCL_MNNVL_ENABLE=${MNNVL_ENABLE}"
@@ -881,6 +892,18 @@ if [[ $INFO -eq 1 ]]; then
   LOG="${LOG%.log}_info.log"
 else
   NCCL_ENV+=(NCCL_DEBUG=WARN)
+fi
+if [[ $GPU_RANK -eq 1 ]]; then
+  # nccl_pairwise_rank does not link MPI: NCCL bootstraps from rank 0's host
+  # (the first hostfile entry), and the node list labels the ranking table
+  NCCL_ENV+=("NCCL_COMM_ID=${RUN_NODES[0]}:29517" "GPU_RANK_NODES=$(IFS=,; echo "${RUN_NODES[*]}")")
+  RANK_BIN="$PACK_DIR/bin/nccl_pairwise_rank"
+  RANK_CSV="${RESULTS_DIR}/${STAMP}_${NODES_REQUESTED}node_gpu_rank_matrix.csv"
+  if [[ ! -x "$RANK_BIN" ]]; then
+    echo "ERROR: $RANK_BIN not in this pack -- rebuild it with pack/build_vr_pack.sh (it adds" >&2
+    echo "       nccl_pairwise_rank) and redeploy" >&2
+    exit 1
+  fi
 fi
 ENV_ARGS=(); for kv in "${NCCL_ENV[@]}"; do ENV_ARGS+=(-x "$kv"); done
 
@@ -904,20 +927,24 @@ run_one() {
     --mca coll_hcoll_enable 0
     --mca mca_base_component_show_load_errors 0
     -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH "${ENV_ARGS[@]}"
-    "$bin" "$@" -g 1)
+    "$bin" "$@")
   echo "--- ${label} ---"
   echo "+ ${cmd[*]}"
   [[ $DRY_RUN -eq 1 ]] && return 0
   "${cmd[@]}"
 }
 
-AR_ARGS=(-b 8 -e "$MAX_SIZE" -f 2)
-A2A_ARGS=(-d uint8 -b 8 -e "$MAX_SIZE" -f 2)
+AR_ARGS=(-b 8 -e "$MAX_SIZE" -f 2 -g 1)
+A2A_ARGS=(-d uint8 -b 8 -e "$MAX_SIZE" -f 2 -g 1)
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "Hostfile ${HOSTFILE}:"; sed 's/^/  /' "$HOSTFILE"
-  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}"
-  run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}"
+  if [[ $GPU_RANK -eq 1 ]]; then
+    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" "${RANK_ARGS[@]}"
+  else
+    run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}"
+    run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}"
+  fi
   echo "=== Dry run: nothing executed$([[ $PREFLIGHT_RC -ne 0 ]] && echo '; pre-flight FAILED (see above)') ==="
   exit $PREFLIGHT_RC
 fi
@@ -942,10 +969,15 @@ hide_known_warns() {
 
 {
   echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | pack nccl ${P_NCCL[$NODE00]:-?} cuda ${P_CUDA[$NODE00]:-?} sha ${P_SHA[$NODE00]:-?} | launch $(hostname)"
-  run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}" \
-    || echo "!!! All-Reduce exited with error $?"
-  run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
-    || echo "!!! All-to-All exited with error $?"
+  if [[ $GPU_RANK -eq 1 ]]; then
+    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" "${RANK_ARGS[@]}" \
+      || echo "!!! GPU rank exited with error $?"
+  else
+    run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}" \
+      || echo "!!! All-Reduce exited with error $?"
+    run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
+      || echo "!!! All-to-All exited with error $?"
+  fi
   echo "$(date) : Done."
 } 2>&1 | tee "$LOG" | hide_known_warns
 
@@ -957,6 +989,11 @@ grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" \
   | awk '/Cuda failure/ { k=$0; sub(/^.*\(/, "", k); if (seen[k]++) next } { print }' | head -20 || true
 RC=0
 grep -aq "!!! " "$LOG" && RC=1
+if [[ $GPU_RANK -eq 1 ]]; then
+  # the ranking table itself is printed above by rank 0
+  if [[ -s "$RANK_CSV" ]]; then echo "GPU rank: table above; pairwise matrix (GB/s): $RANK_CSV"
+  else echo "!!! GPU rank wrote no matrix ($RANK_CSV)"; RC=1; fi
+else
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1
 grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && RC=1
 
@@ -976,6 +1013,7 @@ if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
     fi
   fi
 fi
+fi   # GPU_RANK
 
 # New NVLink inband/Xid kernel errors on any tray during the run fail it, even
 # when the numbers look fine: the test is about NVLink robustness.
@@ -1045,6 +1083,7 @@ Next: ssh ${RUN_USER}@${NODE00} then 'bash ${RUN_DIR}/run_vr_nccl_test.sh'
         bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs)
         bash ${RUN_DIR}/run_vr_nccl_test.sh --check    # pre-flight only, nothing changed
         bash ${RUN_DIR}/run_vr_nccl_test.sh --info     # NCCL INFO -> /tmp/nccl_info/
+        bash ${RUN_DIR}/run_vr_nccl_test.sh --gpu-rank # rank every GPU, slowest first
 
 MSG
 fi
