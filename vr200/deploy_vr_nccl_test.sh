@@ -162,7 +162,7 @@ qargs() { [[ $# -eq 0 ]] || printf '%q ' "$@"; }
 echo "=== deploy_vr_nccl_test.sh ${SCRIPT_VERSION} | ${#NODES[@]} tray(s) | node-00=${NODE00} | user=${RUN_USER} | UUID=${MNNVL_UUID:-auto} ==="
 echo "    trays: ${NODES[*]}"
 echo "    pack:  ${PACK_BASENAME} ($(du -h "$PACK" | cut -f1), sha256 ${PACK_SHA:0:16}...)"
-echo "$PACK_INFO" | grep -E '^(nccl|cuda|openmpi|nccl_tests|built)=' | sed 's/^/           /'
+echo "$PACK_INFO" | grep -E '^(nccl|cuda|openmpi|nccl_tests|gpu_rank|built|builder)=' | sed 's/^/           /'
 [[ $DRY_RUN -eq 1 ]] && echo ">>> DRY-RUN: nothing is changed on any tray <<<"
 
 # --- [bootstrap] seed the jumper's key with a password, once --------------

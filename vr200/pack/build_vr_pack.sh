@@ -36,6 +36,7 @@
 #   bash build_vr_pack.sh --nccl-debs ~/drop/     # NCCL .debs you already have
 #   bash build_vr_pack.sh --no-smoke              # skip the 4-GPU test run
 #   bash build_vr_pack.sh --clean                 # rebuild Open MPI too
+#   bash build_vr_pack.sh --version
 #
 # Options: --work <dir> (default ~/vr-pack-build), -o <out.tar.gz> (default
 # <work>/nccl-test-pack-vr-arm64.tar.gz), --nccl-tests-repo <url> (used when
@@ -48,6 +49,7 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="1.0-vr"   # recorded in PACK_INFO as builder=
 WORK="${HOME%/}/vr-pack-build"
 OUT=""
 TESTS_SRC="${HOME%/}/nccl-tests"
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --no-smoke)        SMOKE=0; shift ;;
     --clean)           CLEAN=1; shift ;;
     --rank-src)        RANK_SRC="$2"; shift 2 ;;
+    --version)         echo "build_vr_pack.sh version ${SCRIPT_VERSION}"; exit 0 ;;
     -h|--help)         awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *)                 echo "ERROR: unknown argument: $1 (see --help)" >&2; exit 1 ;;
   esac
@@ -89,6 +92,7 @@ step() { echo; echo "=== $* ==="; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 # --- 0. what this tray has -----------------------------------------------------
+echo "=== build_vr_pack.sh ${SCRIPT_VERSION} | $(hostname) | user $(whoami) ==="
 step "Checking the build tray"
 [[ "$(uname -m)" == "aarch64" ]] || die "this is $(uname -m); build on a VR200 tray (aarch64)"
 for t in gcc g++ make tar sha256sum objdump ldd; do command -v "$t" >/dev/null || die "'$t' not found (build-essential / binutils)"; done
@@ -339,6 +343,7 @@ cudart=$(basename "$(readlink -f lib/libcudart.so.[0-9]*)")
 openmpi=${OMPI_VERSION} (--without-slurm)
 nccl_tests=${TESTS_REF}
 gpu_rank=nccl_pairwise_rank (source sha256 ${RANK_DESC:-none})
+builder=build_vr_pack.sh ${BUILDER_VERSION:-?}
 gencode=${NVCC_GENCODE:-default}
 built_on=$(hostname) $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") $(uname -r)
 glibc=$(ldd --version | head -1 | awk '{print $NF}')
@@ -347,7 +352,7 @@ cat PACK_INFO
 echo "lib/: $(ls lib | wc -l) entries, bin/: $(ls bin | wc -l) entries, $(du -sh . | cut -f1)"
 ASSEMBLE
 )
-CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" NCCL_DIR="$NCCL_DIR" RANK_DESC="$RANK_DESC" \
+CUDA_HOME="$CUDA_HOME" NVCC_GENCODE="$NVCC_GENCODE" NCCL_DIR="$NCCL_DIR" RANK_DESC="$RANK_DESC" BUILDER_VERSION="$SCRIPT_VERSION" \
   NCCL_INFO="$(cat "$NCCL_DIR/VERSION")" NCCL_VERSION="$NCCL_VERSION" \
   bash -c "$ASSEMBLE_SH" assemble "$PACK" "$TESTS_DESC" "$OMPI_VERSION"
 
