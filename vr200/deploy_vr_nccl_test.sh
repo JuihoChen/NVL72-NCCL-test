@@ -395,7 +395,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.16-vr"
+SCRIPT_VERSION="0.17-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -988,16 +988,17 @@ hide_known_warns() {
 
 # --- 4. Summary ------------------------------------------------------------
 echo ""
-echo "=== Summary ==="
+# With --gpu-rank the summary has two blocks, one per test, each with its own
+# verdict; the overall RESULT (which also covers the dmesg/--info checks) ends it.
+if [[ $GPU_RANK -eq 1 ]]; then echo "=== Summary: NCCL test (all-reduce + all-to-all) ==="
+else echo "=== Summary ==="; fi
 # per-test lines always; repeated CUDA failure lines (one per rank) only once
-# (the GPU rank section gets its own lines below, after the busbw check that
-# belongs to all-reduce/all-to-all)
 grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" | grep -avE "^--- GPU rank|^!!! GPU rank" \
   | awk '/Cuda failure/ { k=$0; sub(/^.*\(/, "", k); if (seen[k]++) next } { print }' | head -20 || true
-RC=0
-grep -aq "!!! " "$LOG" && RC=1
-grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || RC=1
-grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && RC=1
+NCCL_RC=0
+grep -a "!!! " "$LOG" | grep -avq "^!!! GPU rank" && NCCL_RC=1
+grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || NCCL_RC=1
+grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && NCCL_RC=1
 
 # With NCCL_MNNVL_ENABLE=1 NCCL init already fails without NVLink between trays.
 # The busbw floor also catches =2 (auto) quietly falling back to sockets over the
@@ -1009,18 +1010,31 @@ if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
     if awk -v p="$PEAK" -v m="$MIN_MNNVL_BUSBW" 'BEGIN { exit !(p < m) }'; then
       echo "!!! peak busbw ${PEAK} GB/s < ${MIN_MNNVL_BUSBW} GB/s across ${NODES_REQUESTED} trays: NVLink between trays was NOT used"
       echo "    Check IMEX/fabric/NVLink health, or re-run with --info to see the transports."
-      RC=1
+      NCCL_RC=1
     else
       echo "Peak busbw ${PEAK} GB/s across ${NODES_REQUESTED} trays (>= ${MIN_MNNVL_BUSBW}: NVLink between trays in use)"
     fi
   fi
 fi
+RC=$NCCL_RC
 if [[ $GPU_RANK -eq 1 ]]; then
-  # the ranking table itself is printed above by rank 0
-  echo "--- GPU rank (${RUN_GPUS} GPUs) ---"
-  grep -a "^!!! GPU rank" "$LOG" || true
-  if [[ -s "$RANK_CSV" ]]; then echo "GPU rank: table above; pairwise matrix (GB/s): $RANK_CSV"
-  else echo "!!! GPU rank wrote no matrix ($RANK_CSV)"; RC=1; fi
+  echo "NCCL test: $([[ $NCCL_RC -eq 0 ]] && echo PASS || echo FAIL)"
+  echo ""
+  echo "=== Summary: GPU rank (nccl_pairwise_rank, ${RUN_GPUS} GPUs) ==="
+  # the full ranking table is printed above by rank 0; here only its key lines
+  RANK_RC=0
+  grep -a "^!!! GPU rank" "$LOG" && RANK_RC=1
+  grep -a "^rack median score" "$LOG" | tail -1 || true
+  awk '/^=== GPU ranking/ { f = 1 } f && $1 == "1" && $2 ~ /^[0-9]+$/ && NF >= 7 {
+         printf "slowest GPU: rank %s %s %s, score %s GB/s (%s of median)\n", $2, $3, $4, $5, $6
+         v = $6; sub(/%/, "", v)
+         if (v + 0 < 95) print "    below 95% of the median: check this GPU (and the partners listed for it in the table)"
+         exit }' "$LOG"
+  if [[ -s "$RANK_CSV" ]]; then echo "pairwise matrix (GB/s): $RANK_CSV"
+  else echo "!!! GPU rank wrote no matrix ($RANK_CSV)"; RANK_RC=1; fi
+  echo "GPU rank: $([[ $RANK_RC -eq 0 ]] && echo PASS || echo FAIL)"
+  [[ $RANK_RC -eq 0 ]] || RC=1
+  echo ""
 fi
 
 # New NVLink inband/Xid kernel errors on any tray during the run fail it, even
