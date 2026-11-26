@@ -51,7 +51,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.6-vr"
+SCRIPT_VERSION="0.7-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -71,6 +71,8 @@ DRY_RUN=0
 CHECK=0
 ANY_GPU=0
 GB300_PACK=nccl-test-pack-arm64.tar.gz   # what ../deploy_rack_nccl_test.sh leaves in the data dir
+PACK_MARKER=.pack_extracted               # in the data dir: "pack <sha256>", then sha256sum of the key files
+PACK_KEY_FILES="bin/mpirun bin/orted bin/all_reduce_perf bin/alltoall_perf lib/libnccl.so.2 PACK_INFO"
 VERSIONS_WARN=0
 MNNVL_UUID=""
 RUN_ARGS=()
@@ -245,12 +247,21 @@ deploy_pack_node() {
   local old
   old=$(ssh_to "$ip" "cd '$PACK_DIR' && for f in run/run_nccl_test.sh $GB300_PACK; do [ \"\$f\" != '$PACK_BASENAME' ] && [ -e \"\$f\" ] && rm -f \"\$f\" && echo \"\$f\"; done; true" || true)
   [[ -n "$old" ]] && echo "removed GB300 leftovers: $(echo "$old" | xargs)"
-  ssh_to "$ip" "cd '$PACK_DIR' && rm -rf bin lib share PACK_INFO PACK_LIBS && tar xzf '$PACK_CACHE' && test -x bin/mpirun -a -x bin/orted -a -x bin/all_reduce_perf"
+  # The marker records which pack was extracted and the sha256 of its key files.
+  # Same pack and the files unchanged (no interrupted extract, no other deploy
+  # over it): nothing to do. Otherwise delete and extract again.
+  if ssh_to "$ip" "cd '$PACK_DIR' && [ \"\$(head -1 $PACK_MARKER 2>/dev/null)\" = 'pack $PACK_SHA' ] && tail -n +2 $PACK_MARKER | sha256sum -c --quiet >/dev/null 2>&1"; then
+    echo "pack already extracted (same sha256, files intact) -- skipping extract"
+  else
+    echo "extracting the pack (old bin/ lib/ share/ deleted first)"
+    ssh_to "$ip" "cd '$PACK_DIR' && rm -rf bin lib share PACK_INFO PACK_LIBS $PACK_MARKER && tar xzf '$PACK_CACHE' && test -x bin/mpirun -a -x bin/orted -a -x bin/all_reduce_perf \
+      && { { echo 'pack $PACK_SHA'; sha256sum $PACK_KEY_FILES; } > $PACK_MARKER.part 2>/dev/null && mv $PACK_MARKER.part $PACK_MARKER || rm -f $PACK_MARKER.part; }"
+  fi
   echo "pack ready at $PACK_DIR"
 }
 if [[ $DRY_RUN -eq 1 ]]; then
   for ip in "${TARGET_NODES[@]}"; do
-    echo "[DRY-RUN] $ip: copy $PACK_BASENAME to $PACK_CACHE unless its sha256 matches, extract into $PACK_DIR"
+    echo "[DRY-RUN] $ip: copy $PACK_BASENAME to $PACK_CACHE unless its sha256 matches, extract into $PACK_DIR unless already extracted and intact"
   done
 else
   TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
@@ -534,7 +545,7 @@ fi
 if [[ ! -x "$PACK_DIR/bin/mpirun" || ! -x "$PACK_DIR/bin/orted" || ! -x "$PACK_DIR/bin/all_reduce_perf" \
       || ! -x "$PACK_DIR/bin/alltoall_perf" || ! -f "$PACK_DIR/PACK_INFO" ]]; then
   if [[ "$DRY_RUN" -eq 1 ]]; then warn "pack missing/incomplete in $PACK_DIR (would re-extract $PACK_CACHE)"
-  elif [[ -f "$PACK_CACHE" ]] && (cd "$PACK_DIR" && rm -rf bin lib share PACK_INFO PACK_LIBS && tar xzf "$PACK_CACHE"); then
+  elif [[ -f "$PACK_CACHE" ]] && (cd "$PACK_DIR" && rm -rf bin lib share PACK_INFO PACK_LIBS .pack_extracted && tar xzf "$PACK_CACHE"); then
     ok "pack was incomplete -- re-extracted from $PACK_CACHE"
   else bad "pack missing in $PACK_DIR and no usable cache at $PACK_CACHE -- re-run deploy_vr_nccl_test.sh"; fi
 fi
