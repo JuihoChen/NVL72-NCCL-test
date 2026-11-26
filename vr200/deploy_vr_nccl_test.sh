@@ -395,7 +395,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.15-vr"
+SCRIPT_VERSION="0.16-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -895,8 +895,10 @@ else
 fi
 if [[ $GPU_RANK -eq 1 ]]; then
   # nccl_pairwise_rank does not link MPI: NCCL bootstraps from rank 0's host
-  # (the first hostfile entry), and the node list labels the ranking table
-  NCCL_ENV+=("NCCL_COMM_ID=${RUN_NODES[0]}:29517" "GPU_RANK_NODES=$(IFS=,; echo "${RUN_NODES[*]}")")
+  # (the first hostfile entry), and the node list labels the ranking table.
+  # Only the ranking run gets these: all-reduce/all-to-all stay exactly as
+  # without --gpu-rank.
+  RANK_ENV_ARGS=(-x "NCCL_COMM_ID=${RUN_NODES[0]}:29517" -x "GPU_RANK_NODES=$(IFS=,; echo "${RUN_NODES[*]}")")
   RANK_BIN="$PACK_DIR/bin/nccl_pairwise_rank"
   RANK_CSV="${RESULTS_DIR}/${STAMP}_${NODES_REQUESTED}node_gpu_rank_matrix.csv"
   if [[ ! -x "$RANK_BIN" ]]; then
@@ -906,6 +908,7 @@ if [[ $GPU_RANK -eq 1 ]]; then
   fi
 fi
 ENV_ARGS=(); for kv in "${NCCL_ENV[@]}"; do ENV_ARGS+=(-x "$kv"); done
+EXTRA_ENV_ARGS=()   # per-run extras (set only around the GPU rank run)
 
 # The pack's own Open MPI 4.1.6 (built --without-slurm), never the tray's.
 # OPAL_PREFIX makes this relocatable build find its own orted, plugins and
@@ -926,7 +929,7 @@ run_one() {
     --mca oob_tcp_if_include "$MPI_NET"
     --mca coll_hcoll_enable 0
     --mca mca_base_component_show_load_errors 0
-    -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH "${ENV_ARGS[@]}"
+    -x OPAL_PREFIX -x PATH -x LD_LIBRARY_PATH "${ENV_ARGS[@]}" ${EXTRA_ENV_ARGS[@]+"${EXTRA_ENV_ARGS[@]}"}
     "$bin" "$@")
   echo "--- ${label} ---"
   echo "+ ${cmd[*]}"
@@ -941,7 +944,11 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "Hostfile ${HOSTFILE}:"; sed 's/^/  /' "$HOSTFILE"
   run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}"
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}"
-  [[ $GPU_RANK -eq 1 ]] && run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" "${RANK_ARGS[@]}"
+  if [[ $GPU_RANK -eq 1 ]]; then
+    EXTRA_ENV_ARGS=("${RANK_ENV_ARGS[@]}")
+    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" ${RANK_ARGS[@]+"${RANK_ARGS[@]}"}
+    EXTRA_ENV_ARGS=()
+  fi
   echo "=== Dry run: nothing executed$([[ $PREFLIGHT_RC -ne 0 ]] && echo '; pre-flight FAILED (see above)') ==="
   exit $PREFLIGHT_RC
 fi
@@ -971,8 +978,10 @@ hide_known_warns() {
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
     || echo "!!! All-to-All exited with error $?"
   if [[ $GPU_RANK -eq 1 ]]; then
-    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" "${RANK_ARGS[@]}" \
+    EXTRA_ENV_ARGS=("${RANK_ENV_ARGS[@]}")
+    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" ${RANK_ARGS[@]+"${RANK_ARGS[@]}"} \
       || echo "!!! GPU rank exited with error $?"
+    EXTRA_ENV_ARGS=()
   fi
   echo "$(date) : Done."
 } 2>&1 | tee "$LOG" | hide_known_warns
@@ -981,7 +990,9 @@ hide_known_warns() {
 echo ""
 echo "=== Summary ==="
 # per-test lines always; repeated CUDA failure lines (one per rank) only once
-grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" \
+# (the GPU rank section gets its own lines below, after the busbw check that
+# belongs to all-reduce/all-to-all)
+grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" | grep -avE "^--- GPU rank|^!!! GPU rank" \
   | awk '/Cuda failure/ { k=$0; sub(/^.*\(/, "", k); if (seen[k]++) next } { print }' | head -20 || true
 RC=0
 grep -aq "!!! " "$LOG" && RC=1
@@ -1006,6 +1017,8 @@ if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
 fi
 if [[ $GPU_RANK -eq 1 ]]; then
   # the ranking table itself is printed above by rank 0
+  echo "--- GPU rank (${RUN_GPUS} GPUs) ---"
+  grep -a "^!!! GPU rank" "$LOG" || true
   if [[ -s "$RANK_CSV" ]]; then echo "GPU rank: table above; pairwise matrix (GB/s): $RANK_CSV"
   else echo "!!! GPU rank wrote no matrix ($RANK_CSV)"; RC=1; fi
 fi
