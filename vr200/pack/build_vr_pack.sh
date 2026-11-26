@@ -49,7 +49,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0-vr"   # recorded in PACK_INFO as builder=
+SCRIPT_VERSION="1.1-vr"   # recorded in PACK_INFO as builder=
 WORK="${HOME%/}/vr-pack-build"
 OUT=""
 TESTS_SRC="${HOME%/}/nccl-tests"
@@ -376,7 +376,8 @@ fi
 
 # --- 6. tar it up: same top-level layout as the GB300 pack -------------------------
 step "Writing $OUT"
-tar -C "$PACK" -czf "$OUT.part" bin lib share PACK_INFO PACK_LIBS && mv "$OUT.part" "$OUT"
+# PACK_INFO first: deploy_vr_nccl_test.sh reads it without gunzipping the rest
+tar -C "$PACK" -czf "$OUT.part" PACK_INFO PACK_LIBS bin lib share && mv "$OUT.part" "$OUT"
 cat "$PACK/PACK_INFO"
 echo
 echo "Pack ready: $OUT ($(du -h "$OUT" | cut -f1), sha256 $(sha256sum "$OUT" | cut -c1-16)...)"

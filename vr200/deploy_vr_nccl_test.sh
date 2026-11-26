@@ -53,7 +53,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.8-vr"
+SCRIPT_VERSION="0.9-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -109,7 +109,13 @@ done
 if [[ -z "$PACK" ]]; then PACK="$SCRIPT_DIR/$DEFAULT_PACK_NAME"
 elif [[ ! -f "$PACK" ]]; then PACK="$SCRIPT_DIR/$PACK"; fi
 [[ -f "$PACK" ]] || { echo "ERROR: pack not found: $PACK (build it with pack/build_vr_pack.sh)" >&2; exit 1; }
-PACK_INFO=$(tar -xzOf "$PACK" ./PACK_INFO 2>/dev/null || tar -xzOf "$PACK" PACK_INFO 2>/dev/null || true)
+# Reading the pack takes a few seconds for 200+ MB, so say so first. PACK_INFO:
+# try the name build_vr_pack.sh uses first (one gunzip pass, not two);
+# --occurrence=1 stops reading at it, which is at once for packs from
+# build_vr_pack.sh 1.1-vr+ (PACK_INFO first in the tarball).
+echo "Reading $(basename "$PACK") ($(du -h "$PACK" | cut -f1)): PACK_INFO + sha256 ..."
+PACK_INFO=$(tar -xzOf "$PACK" --occurrence=1 PACK_INFO 2>/dev/null \
+            || tar -xzOf "$PACK" --occurrence=1 ./PACK_INFO 2>/dev/null || true)
 [[ -n "$PACK_INFO" ]] || { echo "ERROR: $PACK has no PACK_INFO -- not a VR200 pack from pack/build_vr_pack.sh?" >&2; exit 1; }
 PACK_SHA=$(sha256sum "$PACK" | cut -d' ' -f1)
 PACK_BASENAME=$(basename "$PACK")
@@ -346,7 +352,9 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #     silent fallback to sockets is allowed
 #
 # Run it ON NODE-00 (the first host in the list):
-#   bash run_vr_nccl_test.sh                 # all trays
+#   bash run_vr_nccl_test.sh                 # full rack (default: every tray, e.g. 18 trays / 72 GPUs)
+#   bash run_vr_nccl_test.sh [n]             # the first n trays of the list, node-00 first
+#                                            # (n trays / n*4 GPUs), e.g. 9 = half rack (36 GPUs)
 #   bash run_vr_nccl_test.sh 1               # node-00 only (4 GPUs, smoke test)
 #   bash run_vr_nccl_test.sh --info          # NCCL INFO -> /tmp/nccl_info/ on each tray
 #   bash run_vr_nccl_test.sh --check         # pre-flight only (no repairs), print mpirun
@@ -1099,14 +1107,18 @@ fi
 
 echo "=== Deploy complete: ${#NODES[@]} tray(s), node-00=${NODE00}, ${DATA_DIR} ==="
 if [[ $AUTO -eq 0 ]]; then
+  HALF_LINE=""; HALF=$(( ${#NODES[@]} / 2 ))
+  (( HALF >= 2 )) && printf -v HALF_LINE '        bash %s/run_vr_nccl_test.sh %-3s        # half rack (first %d trays / %d GPUs)\n' \
+    "$RUN_DIR" "$HALF" "$HALF" $(( HALF * 4 ))
   cat <<MSG
 
 Next: ssh ${RUN_USER}@${NODE00} then 'bash ${RUN_DIR}/run_vr_nccl_test.sh'
       (it re-checks/repairs IMEX + channel0 on every tray first, then runs)
       (or re-run this script with --auto to have it run for you)
 
-        bash ${RUN_DIR}/run_vr_nccl_test.sh            # all ${#NODES[@]} trays
-        bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs)
+        bash ${RUN_DIR}/run_vr_nccl_test.sh            # full rack (default: all ${#NODES[@]} trays / $(( ${#NODES[@]} * 4 )) GPUs)
+${HALF_LINE}        bash ${RUN_DIR}/run_vr_nccl_test.sh [n]        # the first n trays, node-00 first (n trays / n*4 GPUs)
+        bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs, smoke test)
         bash ${RUN_DIR}/run_vr_nccl_test.sh --check    # pre-flight only, nothing changed
         bash ${RUN_DIR}/run_vr_nccl_test.sh --info     # NCCL INFO -> /tmp/nccl_info/
         bash ${RUN_DIR}/run_vr_nccl_test.sh --gpu-rank # the test, then every GPU ranked slowest first
