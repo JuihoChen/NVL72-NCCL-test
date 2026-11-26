@@ -208,10 +208,12 @@ the comparison number.
 
 Matching is by substring. Each can be overridden in the environment (on the
 jumper it is then injected into the staged script); `""` skips that check.
-Like GB300, versions are **not judged by default**: a version other than its
-target is printed as `[INFO] ... (version check off)` and the run goes ahead.
-`--versions-warn` makes those lines WARN, and `--versions-check` makes them
-FAIL the pre-flight (the "Checked" column). Pass either to the deploy to pin it
+Like GB300, versions are **not checked by default**: the pre-flight only
+reports what each tray and the pack have (driver, NCCL, CUDA runtime, IMEX,
+NVSHMEM, DOCA) as `[INFO]` lines, with no comparison to the targets below. NVIDIA
+ships minor releases often, so pinned targets would go stale. `--versions-warn`
+compares them and gives WARN for a mismatch; `--versions-check` gives FAIL (the
+"Checked" column). Pass either to the deploy to pin it
 in the staged runner, or to `run_vr_nccl_test.sh` for one run. In every mode the
 driver user space must match the kernel module, and all trays must agree with
 each other on driver, IMEX and pack.

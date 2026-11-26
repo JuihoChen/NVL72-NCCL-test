@@ -378,8 +378,9 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   PACK_DIR     extracted pack (default /root/portable-nccl, or ~/portable-nccl)
 #   PACK_CACHE   the pack's tar.gz, re-extracted from if PACK_DIR is damaged
 #   RESULTS_DIR  (default PACK_DIR/run/results)
-#   VERSIONS_CHECK off (default, like GB300) | warn | fail: what a version other than
-#   its target gives. off prints it as [INFO]; the driver user space / kernel
+#   VERSIONS_CHECK off (default, like GB300) | warn | fail: off only reports the
+#   versions found, as [INFO]; warn / fail compare them with the targets below
+#   and give [WARN] / [FAIL] for a mismatch. The driver user space / kernel
 #   check and the cross-tray "same stack" check apply in every mode.
 #   Target versions (substring match; set one to "" to skip it):
 #   EXPECT_DRIVER 620.70.08 (tray)   EXPECT_IMEX 2.0.0 (tray)
@@ -530,6 +531,15 @@ info() { echo "  $TAG [INFO] $*"; }
 # A version other than its target: [INFO] (check off), [WARN] or [FAIL]
 vbad()  { case "$VWARN" in fail) bad "$*" ;; warn) warn "$*" ;; *) info "$* (version check off)" ;; esac; }
 vwarn() { case "$VWARN" in fail|warn) warn "$*" ;; *) info "$* (version check off)" ;; esac; }
+# Check off (the default, like GB300): versions are only reported, as [INFO],
+# with nothing to compare them to
+if [[ "$VWARN" != warn && "$VWARN" != fail ]]; then
+  EXPECT_DRIVER=""; EXPECT_NCCL=""; EXPECT_NCCL_CUDA=""; EXPECT_CUDA=""
+  EXPECT_IMEX=""; EXPECT_NVSHMEM=""; EXPECT_DOCA=""
+  vok() { info "$@"; }
+else
+  vok() { ok "$@"; }
+fi
 priv() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo -n "$@"; fi; }
 # installed dpkg packages matching an ERE on the package name: "<pkg> <version>" lines
 pkgs() { dpkg-query -W -f='${db:Status-Abbrev}|${Package} ${Version}\n' 2>/dev/null \
@@ -565,24 +575,24 @@ NCCL=$(pinfo nccl); NCCL="${NCCL:-none}"
 CUDA=$(pinfo cuda); CUDA="${CUDA:-none}"
 PSHA=$(sha256sum "$PACK_CACHE" 2>/dev/null | cut -c1-12); PSHA="${PSHA:-none}"
 if [[ ( -z "$EXPECT_NCCL" || "$NCCL" == *"$EXPECT_NCCL"* ) && ( -z "$EXPECT_NCCL_CUDA" || "$NCCL" == *"$EXPECT_NCCL_CUDA"* ) ]]; then
-  ok "pack NCCL $NCCL"
+  vok "pack NCCL $NCCL"
 else vbad "pack NCCL is '$NCCL', expected $EXPECT_NCCL (+$EXPECT_NCCL_CUDA)"; fi
-if [[ -z "$EXPECT_CUDA" || "$CUDA" == "$EXPECT_CUDA"* ]]; then ok "pack CUDA runtime $CUDA, Open MPI $(pinfo openmpi), nccl-tests $(pinfo nccl_tests)"
+if [[ -z "$EXPECT_CUDA" || "$CUDA" == "$EXPECT_CUDA"* ]]; then vok "pack CUDA runtime $CUDA, Open MPI $(pinfo openmpi), nccl-tests $(pinfo nccl_tests)"
 else vbad "pack CUDA runtime is '$CUDA', expected $EXPECT_CUDA"; fi
 
 # IMEX: needed for memory sharing between trays, so a mismatch fails multi-tray runs only
 IMEX=$(pkgs '^nvidia-imex' | head -1); IMEX="${IMEX:-none}"
 IMEX_V=$(nvidia-imex --version 2>/dev/null | head -3 | xargs)
-if [[ -z "$EXPECT_IMEX" || "$IMEX $IMEX_V" == *"$EXPECT_IMEX"* ]]; then ok "IMEX $IMEX${IMEX_V:+ ($IMEX_V)}"
+if [[ -z "$EXPECT_IMEX" || "$IMEX $IMEX_V" == *"$EXPECT_IMEX"* ]]; then vok "IMEX $IMEX${IMEX_V:+ ($IMEX_V)}"
 elif [[ "$MULTI" -eq 1 ]]; then vbad "IMEX is '$IMEX${IMEX_V:+ / $IMEX_V}', expected $EXPECT_IMEX"
 else vwarn "IMEX is '$IMEX${IMEX_V:+ / $IMEX_V}', expected $EXPECT_IMEX (not used by a 1-tray run)"; fi
 
 # Informational: not used by nccl-tests, reported so the stack is on record
 NVSHMEM=$(pkgs '^(lib)?nvshmem' | head -1); NVSHMEM="${NVSHMEM:-none}"
-if [[ -z "$EXPECT_NVSHMEM" || "$NVSHMEM" == *"$EXPECT_NVSHMEM"* ]]; then ok "NVSHMEM $NVSHMEM"
+if [[ -z "$EXPECT_NVSHMEM" || "$NVSHMEM" == *"$EXPECT_NVSHMEM"* ]]; then vok "NVSHMEM $NVSHMEM"
 else vwarn "NVSHMEM is '$NVSHMEM', expected $EXPECT_NVSHMEM"; fi
 DOCA=$(pkgs '^doca-host$' | head -1); [[ -n "$DOCA" ]] || DOCA=$(pkgs '^doca-' | head -1); DOCA="${DOCA:-none}"
-if [[ -z "$EXPECT_DOCA" || "$DOCA" == *"$EXPECT_DOCA"* ]]; then ok "DOCA $DOCA"
+if [[ -z "$EXPECT_DOCA" || "$DOCA" == *"$EXPECT_DOCA"* ]]; then vok "DOCA $DOCA"
 else vwarn "DOCA is '$DOCA', expected DOCA_Host $EXPECT_DOCA"; fi
 
 # Pack binaries: every library resolves (pack lib/ + the tray's base OS and
