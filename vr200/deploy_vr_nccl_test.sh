@@ -39,6 +39,7 @@
 #                        name like GB300 (rack17.sh -> 0x17), unset with --hosts
 #   --versions-warn      version mismatches in the pre-flight are warnings
 #   --check              run only the pre-flight on node-00 after staging
+#   --any-gpu            skip the check that every tray's GPU arch matches the pack
 #
 # EXPECT_* variables set here (see the embedded run_vr_nccl_test.sh) are injected into
 # the staged script and so pinned for later runs.
@@ -50,7 +51,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.5-vr"
+SCRIPT_VERSION="0.6-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -68,6 +69,8 @@ BOOTSTRAP_PASS=""
 AUTO=0
 DRY_RUN=0
 CHECK=0
+ANY_GPU=0
+GB300_PACK=nccl-test-pack-arm64.tar.gz   # what ../deploy_rack_nccl_test.sh leaves in the data dir
 VERSIONS_WARN=0
 MNNVL_UUID=""
 RUN_ARGS=()
@@ -83,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --auto)           AUTO=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     --check)          CHECK=1; shift ;;
+    --any-gpu)        ANY_GPU=1; shift ;;
     --no-check)       CHECK=0; shift ;;   # the default now; kept for old command lines
     --versions-warn)  VERSIONS_WARN=1; shift ;;
     --uuid)           MNNVL_UUID="$2"; shift 2 ;;
@@ -196,6 +200,23 @@ else
     exit 1
   fi
   echo "    OK"
+  # Wrong rack type (e.g. GB300) stops here, before anything is changed: the
+  # pack's binaries are built for one GPU arch only
+  PACK_SM=$(echo "$PACK_INFO" | awk -F= '$1=="gencode"' | grep -oE 'sm_[0-9]+' | head -1 | tr -d 'sm_')
+  if [[ -n "$PACK_SM" && $ANY_GPU -eq 0 ]]; then
+    WRONG=()
+    for ip in "${NODES[@]}"; do
+      cc=$(ssh_to "$ip" "nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sort -u | xargs" || true)
+      [[ "${cc//./}" == "$PACK_SM" ]] || WRONG+=("$ip(${cc:-no GPU info})")
+    done
+    if [[ ${#WRONG[@]} -gt 0 ]]; then
+      echo "ERROR: the pack is built for sm_${PACK_SM} (VR200), but these trays report compute capability: ${WRONG[*]}" >&2
+      echo "       Not a VR200 rack? GB300 (10.3) uses ../deploy_rack_nccl_test.sh. Nothing was changed." >&2
+      echo "       (--any-gpu skips this check)" >&2
+      exit 1
+    fi
+    echo "    GPU arch sm_${PACK_SM} on every tray, matches the pack"
+  fi
 fi
 if [[ -z "$DATA_DIR" ]]; then
   if [[ "$RUN_USER" == root ]]; then DATA_DIR=/root/portable-nccl
@@ -218,7 +239,12 @@ deploy_pack_node() {
     echo "copying pack ($(du -h "$PACK" | cut -f1))"
     ssh_to "$ip" "mkdir -p '$DATA_DIR' && cat > '$PACK_CACHE'.part.\$\$ && mv '$PACK_CACHE'.part.\$\$ '$PACK_CACHE'" < "$PACK"
   fi
-  # Old bin/ lib/ share/ are replaced, so libraries of an older pack cannot linger
+  # Old bin/ lib/ share/ are replaced, so libraries of an older pack cannot linger.
+  # A GB300 deploy's runner and pack tarball are removed too, so nobody runs
+  # the GB300 test (other settings, none of the VR checks) on this rack.
+  local old
+  old=$(ssh_to "$ip" "cd '$PACK_DIR' && for f in run/run_nccl_test.sh $GB300_PACK; do [ \"\$f\" != '$PACK_BASENAME' ] && [ -e \"\$f\" ] && rm -f \"\$f\" && echo \"\$f\"; done; true" || true)
+  [[ -n "$old" ]] && echo "removed GB300 leftovers: $(echo "$old" | xargs)"
   ssh_to "$ip" "cd '$PACK_DIR' && rm -rf bin lib share PACK_INFO PACK_LIBS && tar xzf '$PACK_CACHE' && test -x bin/mpirun -a -x bin/orted -a -x bin/all_reduce_perf"
   echo "pack ready at $PACK_DIR"
 }

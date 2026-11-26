@@ -122,9 +122,14 @@
 # [\$(hostname)]: on some racks every node has the same hostname, which made
 # all 18 lines read [carlonext]. The label matches run_gpu_rank.sh's output.
 
+# v0.25: the old bin/ lib/ share/ (and a VR200 deploy's PACK_INFO, PACK_LIBS
+# and run/run_vr_nccl_test.sh) are removed before extracting, so a rack first
+# deployed with vr200/deploy_vr_nccl_test.sh is redeployed cleanly: no
+# leftover library or Open MPI plugin is loaded ahead of this pack's.
+
 set -euo pipefail
 
-SCRIPT_VERSION="0.24"
+SCRIPT_VERSION="0.25"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -382,7 +387,7 @@ deploy_pack_node() {
   fi
 
   echo "  [$ip] extracting pack to ${PACK_DIR}..."
-  ssh $SSH_OPTS "root@${ip}" "mkdir -p ${PACK_DIR} && tar xzf ${PACK_CACHE} -C ${PACK_DIR}"
+  ssh $SSH_OPTS "root@${ip}" "mkdir -p ${PACK_DIR} && cd ${PACK_DIR} && rm -rf bin lib share PACK_INFO PACK_LIBS run/run_vr_nccl_test.sh && tar xzf ${PACK_CACHE} -C ${PACK_DIR}"
   echo "  [$ip] pack ready at ${PACK_DIR}"
 }
 

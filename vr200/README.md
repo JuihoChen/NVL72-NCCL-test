@@ -135,6 +135,16 @@ picks it). Steps:
    runs only the pre-flight (`run_vr_nccl_test.sh --check`). Otherwise the
    deploy prints the command to run on node-00.
 
+**Same rack, either script.** Both deploys use `/root/portable-nccl` and both
+packs put `bin/ lib/ share/` at its top, so each deploy now deletes those
+before extracting, plus the other script's leftovers. This deploy also
+removes a GB300 `run/run_nccl_test.sh` and `nccl-test-pack-arm64.tar.gz`.
+GB300's deploy (0.25 and later) also removes `PACK_INFO`, `PACK_LIBS` and
+`run/run_vr_nccl_test.sh`. Before changing anything, this deploy also checks
+that every tray's GPU arch matches the pack (`gencode` in `PACK_INFO`, sm_107
+on VR200), so on a GB300 rack (10.3) it stops at step [0/4]. `--any-gpu`
+skips that check.
+
 `--user <name>` runs everything as a normal user instead of root (data dir
 `~/portable-nccl`, repairs through `sudo -n`).
 
