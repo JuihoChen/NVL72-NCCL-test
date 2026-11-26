@@ -145,6 +145,14 @@ that every tray's GPU arch matches the pack (`gencode` in `PACK_INFO`, sm_107
 on VR200), so on a GB300 rack (10.3) it stops at step [0/4]. `--any-gpu`
 skips that check.
 
+A redeploy of the same pack skips the extract when nothing changed: after
+extracting, the deploy writes `.pack_extracted` in the data dir with the
+pack's sha256 and the sha256 of `bin/mpirun`, `bin/orted`, the two `*_perf`
+binaries, `lib/libnccl.so.2` and `PACK_INFO`. If the pack is the same and
+those files still match, the tray is left as it is. Otherwise (a new pack, an
+interrupted extract, another deploy over it) the old folders are deleted and
+the pack extracted again. The GB300 deploy deletes the marker too.
+
 `--user <name>` runs everything as a normal user instead of root (data dir
 `~/portable-nccl`, repairs through `sudo -n`).
 
