@@ -352,7 +352,9 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #     silent fallback to sockets is allowed
 #
 # Run it ON NODE-00 (the first host in the list):
-#   bash run_vr_nccl_test.sh                 # all trays
+#   bash run_vr_nccl_test.sh                 # full rack (default: every tray, e.g. 18 trays / 72 GPUs)
+#   bash run_vr_nccl_test.sh [n]             # the first n trays of the list, node-00 first
+#                                            # (n trays / n*4 GPUs), e.g. 9 = half rack (36 GPUs)
 #   bash run_vr_nccl_test.sh 1               # node-00 only (4 GPUs, smoke test)
 #   bash run_vr_nccl_test.sh --info          # NCCL INFO -> /tmp/nccl_info/ on each tray
 #   bash run_vr_nccl_test.sh --check         # pre-flight only (no repairs), print mpirun
@@ -1105,14 +1107,18 @@ fi
 
 echo "=== Deploy complete: ${#NODES[@]} tray(s), node-00=${NODE00}, ${DATA_DIR} ==="
 if [[ $AUTO -eq 0 ]]; then
+  HALF_LINE=""; HALF=$(( ${#NODES[@]} / 2 ))
+  (( HALF >= 2 )) && printf -v HALF_LINE '        bash %s/run_vr_nccl_test.sh %-3s        # half rack (first %d trays / %d GPUs)\n' \
+    "$RUN_DIR" "$HALF" "$HALF" $(( HALF * 4 ))
   cat <<MSG
 
 Next: ssh ${RUN_USER}@${NODE00} then 'bash ${RUN_DIR}/run_vr_nccl_test.sh'
       (it re-checks/repairs IMEX + channel0 on every tray first, then runs)
       (or re-run this script with --auto to have it run for you)
 
-        bash ${RUN_DIR}/run_vr_nccl_test.sh            # all ${#NODES[@]} trays
-        bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs)
+        bash ${RUN_DIR}/run_vr_nccl_test.sh            # full rack (default: all ${#NODES[@]} trays / $(( ${#NODES[@]} * 4 )) GPUs)
+${HALF_LINE}        bash ${RUN_DIR}/run_vr_nccl_test.sh [n]        # the first n trays, node-00 first (n trays / n*4 GPUs)
+        bash ${RUN_DIR}/run_vr_nccl_test.sh 1          # node-00 only (4 GPUs, smoke test)
         bash ${RUN_DIR}/run_vr_nccl_test.sh --check    # pre-flight only, nothing changed
         bash ${RUN_DIR}/run_vr_nccl_test.sh --info     # NCCL INFO -> /tmp/nccl_info/
         bash ${RUN_DIR}/run_vr_nccl_test.sh --gpu-rank # the test, then every GPU ranked slowest first
