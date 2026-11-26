@@ -217,7 +217,8 @@ required on 2+ trays) and pass/fail rules (new NVLink inband/Xid lines,
 tool, for example `--gpu-rank -- -b 2G -n 20`. The binary is built into the
 pack by `build_vr_pack.sh`, so a pack built before this needs one rebuild.
 The summary then has two blocks, each with its own PASS/FAIL: the NCCL test
-(both collectives and the peak-busbw check), and the GPU rank (rack median,
+(both collectives and the peak-busbw check), printed right after all-to-all and
+before the ranking starts, and at the end the GPU rank (rack median,
 the slowest GPU with its % of the median, and the matrix path). The overall RESULT still covers both, plus the dmesg and `--info` checks.
 Only the ranking run gets `NCCL_COMM_ID`/`GPU_RANK_NODES`, so the NCCL test
 runs exactly as it does without `--gpu-rank`.

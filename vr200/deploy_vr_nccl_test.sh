@@ -395,7 +395,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.17-vr"
+SCRIPT_VERSION="0.18-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -977,26 +977,21 @@ hide_known_warns() {
     || echo "!!! All-Reduce exited with error $?"
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
     || echo "!!! All-to-All exited with error $?"
-  if [[ $GPU_RANK -eq 1 ]]; then
-    EXTRA_ENV_ARGS=("${RANK_ENV_ARGS[@]}")
-    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" ${RANK_ARGS[@]+"${RANK_ARGS[@]}"} \
-      || echo "!!! GPU rank exited with error $?"
-    EXTRA_ENV_ARGS=()
-  fi
-  echo "$(date) : Done."
+  [[ $GPU_RANK -eq 1 ]] || echo "$(date) : Done."
 } 2>&1 | tee "$LOG" | hide_known_warns
 
 # --- 4. Summary ------------------------------------------------------------
+# NCCL test summary first. With --gpu-rank it comes right after all-to-all,
+# before the ranking runs, with its own verdict; the GPU rank summary and the
+# overall RESULT (which also covers the dmesg/--info checks) come at the end.
 echo ""
-# With --gpu-rank the summary has two blocks, one per test, each with its own
-# verdict; the overall RESULT (which also covers the dmesg/--info checks) ends it.
 if [[ $GPU_RANK -eq 1 ]]; then echo "=== Summary: NCCL test (all-reduce + all-to-all) ==="
 else echo "=== Summary ==="; fi
 # per-test lines always; repeated CUDA failure lines (one per rank) only once
-grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" | grep -avE "^--- GPU rank|^!!! GPU rank" \
+grep -aE "^--- |Out of bounds|Avg bus bandwidth|!!! |Cuda failure" "$LOG" \
   | awk '/Cuda failure/ { k=$0; sub(/^.*\(/, "", k); if (seen[k]++) next } { print }' | head -20 || true
 NCCL_RC=0
-grep -a "!!! " "$LOG" | grep -avq "^!!! GPU rank" && NCCL_RC=1
+grep -aq "!!! " "$LOG" && NCCL_RC=1
 grep -ac "Avg bus bandwidth" "$LOG" | grep -qx 2 || NCCL_RC=1
 grep -a "Out of bounds values" "$LOG" | grep -avq " 0 OK" && NCCL_RC=1
 
@@ -1017,8 +1012,19 @@ if [[ $NODES_REQUESTED -gt 1 && $MNNVL_ENABLE -ne 0 ]]; then
   fi
 fi
 RC=$NCCL_RC
+
 if [[ $GPU_RANK -eq 1 ]]; then
   echo "NCCL test: $([[ $NCCL_RC -eq 0 ]] && echo PASS || echo FAIL)"
+  echo ""
+  # the ranking appends to the same log
+  {
+    EXTRA_ENV_ARGS=("${RANK_ENV_ARGS[@]}")
+    run_one "GPU rank (${RUN_GPUS} GPUs)" "$RANK_BIN" -o "$RANK_CSV" ${RANK_ARGS[@]+"${RANK_ARGS[@]}"} \
+      || echo "!!! GPU rank exited with error $?"
+    EXTRA_ENV_ARGS=()
+    echo "$(date) : Done."
+  } 2>&1 | tee -a "$LOG" | hide_known_warns
+
   echo ""
   echo "=== Summary: GPU rank (nccl_pairwise_rank, ${RUN_GPUS} GPUs) ==="
   # the full ranking table is printed above by rank 0; here only its key lines
