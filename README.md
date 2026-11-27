@@ -30,6 +30,9 @@ slowest -> fastest. A slow GPU drags all of its measurements down, while a
 healthy GPU meets it in only a few, so it stands out clearly; healthy GPUs
 also name it as their "worst partner".
 
+How the rounds, the score and the output files work, with a diagram:
+[gpu_rank/README.md](gpu_rank/README.md).
+
 It is separate from the normal test: `run_nccl_test.sh` and
 `deploy_rack_nccl_test.sh` are unchanged, and an already-staged
 `run_nccl_test.sh` works as is. `run_gpu_rank.sh` reuses the same
