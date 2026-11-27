@@ -177,9 +177,12 @@ Every rank prints two WARN lines at NCCL init that do not affect the run:
 `ibvwrap.cc ... lib wrapper not initialized` and `rma_socket.cc ... RMA/Socket :
 rma_socket requires GDRCopy`. NCCL 2.32.6 always probes its internal RMA/GIN
 IB and socket plugins at comm init, even with `NCCL_IB_DISABLE=1` and without
-GDRCopy, and has no setting that skips the probe. The runner hides exactly those
-two messages on the console and prints how many it hid. The log keeps them, and
-`--all-warnings` shows them. Any other NCCL WARN is shown as before.
+GDRCopy, and has no setting that skips the probe. Bundling GDRCopy in the pack
+would not help: `NCCL_GDRCOPY_ENABLE` defaults to 0, so NCCL never loads it, and
+turning it on also moves NCCL's work FIFO into GPU memory, which changes what the
+test measures. The runner hides exactly those two messages, on the console and in
+the log, and ends with a line saying how many it hid. `--all-warnings` keeps them
+in both. Any other NCCL WARN is shown as before.
 
 Settings: built-in defaults < the injected rack settings < environment <
 command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
