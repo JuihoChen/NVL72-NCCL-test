@@ -187,7 +187,11 @@ in both. Any other NCCL WARN is shown as before.
 Settings: built-in defaults < the injected rack settings < environment <
 command line. (Run outside a deploy, a `vr_nccl.conf` next to the script
 can supply them instead.)
-Logs and hostfiles go to `<data-dir>/run/results/`.
+Logs and hostfiles go to `<data-dir>/run/results/`. Every run's files share
+one name, whatever the options (`--gpu-rank`, `--info`, ...):
+`<time>_<N>node.log` (the test, plus the GPU ranking with `--gpu-rank`),
+`<time>_<N>node_preflight.log`, and with `--gpu-rank`
+`<time>_<N>node_gpu_rank_matrix.csv`. The log's first line says what ran.
 
 The test is meant to prove NVLink robustness between trays, so multi-tray
 runs set `NCCL_MNNVL_ENABLE=1` (required): NCCL init fails instead of falling
@@ -256,7 +260,7 @@ The console shows one line per check for the whole rack: FAIL and WARN first,
 then the rest. A line that is the same on every tray says `(all 18 trays)`;
 otherwise it names the trays (`n00-n05 n07-n17`, or `n06/192.168.101.143` for a
 problem on a few trays). Every tray's full pre-flight is saved as
-`results/<time>_preflight.log`, and `--verbose` prints it on the console instead.
+`results/<time>_<N>node_preflight.log`, and `--verbose` prints it on the console instead.
 
 - versions (table above); driver user space **and** kernel module must
   agree (finding 1); `nvidia-smi` works, 4 GPUs visible
