@@ -403,7 +403,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.20-vr"
+SCRIPT_VERSION="0.21-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -759,7 +759,12 @@ FAILED=()
 # Every tray's full pre-flight goes to PF_LOG; the console groups identical lines
 # (one line per check for the whole rack, naming only the trays that differ)
 mkdir -p "$RESULTS_DIR"
-PF_LOG="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_preflight.log"
+# One name stem per run, whatever the options: <time>_<N>node.log (the test,
+# plus the ranking with --gpu-rank), <time>_<N>node_preflight.log and, with
+# --gpu-rank, <time>_<N>node_gpu_rank_matrix.csv. The log's first line says
+# which options ran.
+RUN_STEM="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_${NODES_REQUESTED}node"
+PF_LOG="${RUN_STEM}_preflight.log"
 : > "$PF_LOG"
 declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS P_NVERR
 # Every tray at once (like the deploy's pack copy), so the wait is the slowest
@@ -917,9 +922,7 @@ if [[ ${#RUN_NODES[@]} -le 4 || $VERBOSE -eq 1 ]]; then grep '^Bootstrap: ' "$PF
 else echo "Bootstrap: ${#RUN_NODES[@]} trays, one interface each (names and IPs in $PF_LOG)"; fi
 echo "MPI network: $MPI_NET | NCCL_SOCKET_IFNAME: $NCCL_IFS"
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_KIND=""; [[ $GPU_RANK -eq 1 ]] && LOG_KIND=_gpu_rank
-LOG="${RESULTS_DIR}/${STAMP}_${NODES_REQUESTED}node${LOG_KIND}.log"
+LOG="${RUN_STEM}.log"
 NCCL_ENV=(
   "NCCL_SOCKET_IFNAME=${NCCL_IFS}"
   "NCCL_MNNVL_ENABLE=${MNNVL_ENABLE}"
@@ -934,7 +937,6 @@ NCCL_ENV=(
 [[ -n "$MNNVL_UUID" ]] && NCCL_ENV+=("NCCL_MNNVL_UUID=${MNNVL_UUID}")
 if [[ $INFO -eq 1 ]]; then
   NCCL_ENV+=(NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NVLS,ENV "NCCL_DEBUG_FILE=/tmp/nccl_info/%h.%p.log")
-  LOG="${LOG%.log}_info.log"
 else
   NCCL_ENV+=(NCCL_DEBUG=WARN)
 fi
@@ -945,7 +947,7 @@ if [[ $GPU_RANK -eq 1 ]]; then
   # without --gpu-rank.
   RANK_ENV_ARGS=(-x "NCCL_COMM_ID=${RUN_NODES[0]}:29517" -x "GPU_RANK_NODES=$(IFS=,; echo "${RUN_NODES[*]}")")
   RANK_BIN="$PACK_DIR/bin/nccl_pairwise_rank"
-  RANK_CSV="${RESULTS_DIR}/${STAMP}_${NODES_REQUESTED}node_gpu_rank_matrix.csv"
+  RANK_CSV="${RUN_STEM}_gpu_rank_matrix.csv"
   if [[ ! -x "$RANK_BIN" ]]; then
     echo "ERROR: $RANK_BIN not in this pack -- rebuild it with pack/build_vr_pack.sh (it adds" >&2
     echo "       nccl_pairwise_rank) and redeploy" >&2
@@ -1019,7 +1021,7 @@ hide_known_warns() {
 }
 
 {
-  echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | pack nccl ${P_NCCL[$NODE00]:-?} cuda ${P_CUDA[$NODE00]:-?} sha ${P_SHA[$NODE00]:-?} | launch $(hostname)"
+  echo "$(date) : ${NODES_REQUESTED} node(s) | ${RUN_GPUS} GPUs | ${RUN_NODES[*]} | driver ${P_DRV[$NODE00]:-?} | pack nccl ${P_NCCL[$NODE00]:-?} cuda ${P_CUDA[$NODE00]:-?} sha ${P_SHA[$NODE00]:-?} | launch $(hostname) | run: all-reduce + all-to-all$([[ $GPU_RANK -eq 1 ]] && echo ' + gpu-rank')$([[ $INFO -eq 1 ]] && echo ' (--info)')"
   run_one "All-Reduce (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/all_reduce_perf" "${AR_ARGS[@]}" \
     || echo "!!! All-Reduce exited with error $?"
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
