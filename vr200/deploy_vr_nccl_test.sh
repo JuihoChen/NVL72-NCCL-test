@@ -403,7 +403,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.19-vr"
+SCRIPT_VERSION="0.20-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -517,10 +517,13 @@ echo "pack: ${PACK_DIR} | results: ${RESULTS_DIR}"
 
 # --- 1. SSH: mpirun reaches every node (itself included) over SSH ---------
 echo "=== Checking passwordless SSH to ${#RUN_NODES[@]} node(s) ==="
+# All trays at once: one unreachable tray costs ConnectTimeout once, not per tray
 SSH_BROKEN=()
+declare -A SSH_PID
 for ip in "${RUN_NODES[@]}"; do
-  ssh "${SSH_OPTS[@]}" "$ip" true 2>/dev/null || SSH_BROKEN+=("$ip")
+  ssh -n "${SSH_OPTS[@]}" "$ip" true 2>/dev/null & SSH_PID[$ip]=$!
 done
+for ip in "${RUN_NODES[@]}"; do wait "${SSH_PID[$ip]}" || SSH_BROKEN+=("$ip"); done
 if [[ ${#SSH_BROKEN[@]} -gt 0 ]]; then
   echo "ERROR: passwordless SSH as $(whoami) failed to: ${SSH_BROKEN[*]}" >&2
   echo "       Fix (as $(whoami)): ssh-keygen -t ed25519 (if no key yet), then ssh-copy-id $(whoami)@<ip>" >&2
@@ -638,6 +641,8 @@ IFNAME="${IFLINE%% *}"; IFCIDR="${IFLINE#* }"
 if [[ -n "$IFLINE" ]]; then ok "bootstrap interface $IFNAME ($IFCIDR)"
 else bad "no local interface holds $MYIP"; IFNAME="?"; IFCIDR="?"; fi
 
+# nvidia-smi -q is slow (seconds): run it once, read fabric + health from it
+NSQ=$(nvidia-smi -q 2>/dev/null)
 FABRIC="n/a"; CLUSTER="n/a"
 if [[ "$MULTI" -eq 1 ]]; then
   # IMEX node list must contain every node, in the same order, on every node
@@ -671,8 +676,8 @@ if [[ "$MULTI" -eq 1 ]]; then
   else ok "channel0 present"; fi
 
   # NVLink fabric registration (needed for MNNVL between the nodes)
-  FABRIC=$(nvidia-smi -q 2>/dev/null | awk '/^ *Fabric *$/{f=1;next} f&&/State/{print $NF;exit}')
-  CLUSTER=$(nvidia-smi -q 2>/dev/null | awk -F': *' '/ClusterUUID/{print $2;exit}')
+  FABRIC=$(echo "$NSQ" | awk '/^ *Fabric *$/{f=1;next} f&&/State/{print $NF;exit}')
+  CLUSTER=$(echo "$NSQ" | awk -F': *' '/ClusterUUID/{print $2;exit}')
   FABRIC="${FABRIC:-unknown}"; CLUSTER="${CLUSTER:-unknown}"
   if [[ "$FABRIC" == "Completed" ]]; then ok "fabric Completed, ClusterUUID $CLUSTER"
   else warn "fabric state '$FABRIC' -- multi-node NVLink may not be available"; fi
@@ -680,8 +685,8 @@ fi
 
 # Fabric HEALTH (not just State): Route Unhealthy=True disables CUDA P2P even
 # inside one tray (seen with a GFM partition that still expected missing trays)
-HSUM=$(nvidia-smi -q 2>/dev/null | awk -F': *' '/^ *Summary/ {print $2}' | sort -u | xargs)
-ROUTE=$(nvidia-smi -q 2>/dev/null | awk -F': *' '/Route Unhealthy/ {print $2}' | sort -u | xargs)
+HSUM=$(echo "$NSQ" | awk -F': *' '/^ *Summary/ {print $2}' | sort -u | xargs)
+ROUTE=$(echo "$NSQ" | awk -F': *' '/Route Unhealthy/ {print $2}' | sort -u | xargs)
 if [[ -n "$ROUTE" ]]; then
   if [[ "$ROUTE" == "False" && "$HSUM" == "Healthy" ]]; then ok "fabric health Healthy, routes OK"
   else bad "fabric health '$HSUM', Route Unhealthy '$ROUTE' -- check the NVLink partition on the GFM switch (nv show sdn partition)"; fi
@@ -757,15 +762,47 @@ mkdir -p "$RESULTS_DIR"
 PF_LOG="${RESULTS_DIR}/$(date +%Y%m%d_%H%M%S)_preflight.log"
 : > "$PF_LOG"
 declare -A P_DRV P_NCCL P_CLUSTER P_IF P_CIDR P_SHA P_CUDA P_IMEX P_NVLINKS P_NVERR
-for ip in "${RUN_NODES[@]}"; do
-  OUT=$(ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
-          "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
-          "$IMEX_CFG" "$HOSTS_RAW" "$DRY_RUN" "$INFO" "$MULTI" "$ip" \
-          "$EXPECT_CUDA" "$EXPECT_NCCL_CUDA" "$EXPECT_IMEX" "$EXPECT_NVSHMEM" "$EXPECT_DOCA" \
-          "$VERSIONS_CHECK" <<< "$REMOTE_PREFLIGHT" 2>&1) || true
+# Every tray at once (like the deploy's pack copy), so the wait is the slowest
+# tray, not the sum. Outputs go to a temp dir (removed at exit) and are read
+# back in host-list order below, so the log and summary look as before.
+PF_TMP=$(mktemp -d); trap 'rm -rf "$PF_TMP"' EXIT
+declare -A PF_PID
+for i in "${!RUN_NODES[@]}"; do
+  ip="${RUN_NODES[$i]}"
+  ( ssh "${SSH_OPTS[@]}" "$ip" bash -s -- \
+      "$EXPECT_DRIVER" "$EXPECT_NCCL" "$PACK_DIR" "$PACK_CACHE" \
+      "$IMEX_CFG" "$HOSTS_RAW" "$DRY_RUN" "$INFO" "$MULTI" "$ip" \
+      "$EXPECT_CUDA" "$EXPECT_NCCL_CUDA" "$EXPECT_IMEX" "$EXPECT_NVSHMEM" "$EXPECT_DOCA" \
+      "$VERSIONS_CHECK" <<< "$REMOTE_PREFLIGHT" > "$PF_TMP/$i" 2>&1 || true ) &
+  PF_PID[$i]=$!
+done
+# One line per tray as it finishes (like GB300's per-node pre-flight lines),
+# so the wait is visibly the checks; the grouped detail follows below
+echo "  checking ${#RUN_NODES[@]} tray(s) in parallel: driver, pack, IMEX, fabric, NVLink, dmesg"
+PF_START=$SECONDS
+declare -A PF_SEEN; PF_DONE=0
+while (( PF_DONE < ${#RUN_NODES[@]} )); do
+  for i in "${!RUN_NODES[@]}"; do
+    [[ -n "${PF_SEEN[$i]:-}" ]] && continue
+    kill -0 "${PF_PID[$i]}" 2>/dev/null && continue
+    wait "${PF_PID[$i]}" || true
+    PF_SEEN[$i]=1; PF_DONE=$(( PF_DONE + 1 ))
+    NF=$(grep -c '\] \[FAIL\]' "$PF_TMP/$i" || true); NW=$(grep -c '\] \[WARN\]' "$PF_TMP/$i" || true)
+    if ! grep -q '^PREFLIGHT|' "$PF_TMP/$i"; then R="did not complete"
+    elif (( NF > 0 )); then R="$NF FAIL"
+    else R="OK"; fi
+    if (( NW > 0 )) && [[ "$R" != "did not complete" ]]; then R="$R, $NW WARN"; fi
+    printf '  [n%02d/%s] pre-flight %s  (%d/%d, %ds)\n' "$i" "${RUN_NODES[$i]}" "$R" \
+      "$PF_DONE" "${#RUN_NODES[@]}" "$(( SECONDS - PF_START ))"
+  done
+  if (( PF_DONE < ${#RUN_NODES[@]} )); then sleep 0.3; fi
+done
+for i in "${!RUN_NODES[@]}"; do
+  ip="${RUN_NODES[$i]}"
+  OUT=$(cat "$PF_TMP/$i")
   echo "$OUT" | grep -v '^PREFLIGHT|' >> "$PF_LOG"
   [[ $VERBOSE -eq 1 ]] && echo "$OUT" | grep -v '^PREFLIGHT|'
-  LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1)
+  LINE=$(echo "$OUT" | grep '^PREFLIGHT|' | tail -1 || true)
   if [[ -z "$LINE" ]]; then FAILED+=("$ip"); echo "  [$ip] [FAIL] pre-flight did not complete" | tee -a "$PF_LOG"; continue; fi
   IFS='|' read -r _ rc drv nccl _fabric cluster ifname ifcidr psha cuda imex links nverr <<< "$LINE"
   P_NVERR[$ip]="$nverr"
