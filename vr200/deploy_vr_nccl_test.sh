@@ -403,7 +403,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.18-vr"
+SCRIPT_VERSION="0.19-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -963,9 +963,11 @@ fi
 
 # NCCL 2.32 probes its internal RMA/GIN plugins at every comm init, even with
 # NCCL_IB_DISABLE=1 and no GDRCopy, and each rank prints two WARN lines that do
-# not affect the run (no NCCL setting skips that probe). They are hidden on the
-# console only (with the empty line NCCL prints before each), counted at the end,
-# and kept in the log; --all-warnings shows them.
+# not affect the run (no NCCL setting skips that probe; bundling GDRCopy would
+# not help either: NCCL_GDRCOPY_ENABLE defaults to 0, and enabling it changes
+# NCCL's work-FIFO path). They are hidden on the console and in the log (with
+# the empty line NCCL prints before each) and counted at the end, so testers
+# do not doubt a good result; --all-warnings keeps them in both.
 KNOWN_WARN_RE='ibvwrap[.]cc:[0-9]+ .*NCCL WARN lib wrapper not initialized|rma_socket[.]cc:[0-9]+ .*NCCL WARN RMA/Socket : rma_socket requires GDRCopy'
 hide_known_warns() {
   if [[ $ALL_WARNINGS -eq 1 ]]; then cat; return; fi
@@ -976,7 +978,7 @@ hide_known_warns() {
     $0 ~ re { n++; if (blank) blank--; next }
     { while (blank) { print ""; blank-- } print; fflush() }
     END { while (blank) { print ""; blank-- }
-          if (n) printf "(%d known-harmless NCCL init WARN line(s) hidden: ibv_alloc_pd wrapper / RMA socket GDRCopy; see the log or --all-warnings)\n", n }'
+          if (n) printf "(%d known-harmless NCCL init WARN line(s) hidden: ibv_alloc_pd wrapper / RMA socket GDRCopy; they do not affect the results; --all-warnings shows them)\n", n }'
 }
 
 {
@@ -986,7 +988,7 @@ hide_known_warns() {
   run_one "All-to-All (${RUN_GPUS} GPUs)" "$PACK_DIR/bin/alltoall_perf" "${A2A_ARGS[@]}" \
     || echo "!!! All-to-All exited with error $?"
   [[ $GPU_RANK -eq 1 ]] || echo "$(date) : Done."
-} 2>&1 | tee "$LOG" | hide_known_warns
+} 2>&1 | hide_known_warns | tee "$LOG"
 
 # --- 4. Summary ------------------------------------------------------------
 # NCCL test summary first. With --gpu-rank it comes right after all-to-all,
@@ -1031,7 +1033,7 @@ if [[ $GPU_RANK -eq 1 ]]; then
       || echo "!!! GPU rank exited with error $?"
     EXTRA_ENV_ARGS=()
     echo "$(date) : Done."
-  } 2>&1 | tee -a "$LOG" | hide_known_warns
+  } 2>&1 | hide_known_warns | tee -a "$LOG"
 
   echo ""
   echo "=== Summary: GPU rank (nccl_pairwise_rank, ${RUN_GPUS} GPUs) ==="
