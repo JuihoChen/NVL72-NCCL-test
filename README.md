@@ -17,6 +17,21 @@ cd vr200
 ./deploy_vr_nccl_test.sh rackNN.sh --auto
 ```
 
+## No rack file? `--hosts` with an IP range or a file
+
+Both deploy scripts take `--hosts` instead of `rackXX.sh`, e.g. at a field
+site: `--hosts 10.0.0.11-28` is 18 nodes (10.0.0.11 = node-00 ... 10.0.0.28),
+and `--hosts nodes.txt` reads IPs and/or ranges from a file (one or more per
+line, `#` comments). A range may count down: `192.168.101.154-137` makes
+.154 node-00, then .153 ... .137. Items can be mixed with commas
+(`10.0.0.11-26,10.0.0.30,10.0.0.31`); the order given is the node order, so
+node-00 is the first IP. `--only` takes the same forms.
+
+```bash
+./deploy_rack_nccl_test.sh --hosts 10.0.0.11-28 --uuid 0x17      # GB300 (give --uuid)
+vr200/deploy_vr_nccl_test.sh --hosts 10.0.0.11-28                # VR200
+```
+
 ## Ranking all GPUs by speed in one run
 
 `gpu_rank/` ranks every GPU of the rack by NCCL point-to-point bandwidth from

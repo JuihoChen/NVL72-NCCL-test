@@ -106,6 +106,8 @@ PACK_LIBS ldd of all_reduce_perf against the pack
 cd vr200
 ./deploy_vr_nccl_test.sh rackNN.sh                  # CM_IPS from a GB300-style rack file
 ./deploy_vr_nccl_test.sh --hosts 192.168.101.136,192.168.101.137   # or a list, node-00 first
+./deploy_vr_nccl_test.sh --hosts 192.168.101.136-153  # no rack file: 18 trays, .136 = node-00
+./deploy_vr_nccl_test.sh --hosts trays.txt          # or a file of IPs / ranges
 ./deploy_vr_nccl_test.sh rackNN.sh my-pack.tar.gz   # default ./nccl-test-pack-vr-arm64.tar.gz
 ./deploy_vr_nccl_test.sh rackNN.sh --only <ip>      # re-push to a swapped tray only
 ./deploy_vr_nccl_test.sh rackNN.sh --bootstrap [password]
@@ -116,7 +118,26 @@ cd vr200
 node-00 is the LAST entry of `CM_IPS` (same reversal as GB300) or the first
 of `--hosts`. `NCCL_MNNVL_UUID` is derived from the rack file name like GB300
 (`rack17.sh` -> `0x17`, `--uuid` overrides; unset with `--hosts`, so NCCL
-picks it). Steps:
+picks it).
+
+**No rack file (e.g. a field site):** `--hosts` (and `--only`) take IPs,
+ranges of the last number and/or a file, comma separated, used in the order
+given (node-00 = the first IP). `10.0.0.11-28` is 18 trays, 10.0.0.11 to
+10.0.0.28; `10.0.0.11-10.0.0.28` is the same. A range can also count down:
+`192.168.101.154-137` is 18 trays with node-00 = .154, then .153 ... .137. A file holds the same items,
+one or more per line, with `#` comments, e.g.
+
+```text
+# rack at site X, node-00 first
+10.0.0.11-26
+10.0.0.30 10.0.0.31   # two trays on other IPs
+```
+
+Duplicate or malformed IPs stop the deploy before anything is changed. The
+same forms work for `run_vr_nccl_test.sh --hosts` on node-00 and for
+`../deploy_rack_nccl_test.sh --hosts` (GB300).
+
+Steps:
 
 0. Passwordless SSH jumper -> every tray (`--bootstrap` seeds the key with
    `sshpass`). Stale `known_hosts` entries are cleared (tray swap).
