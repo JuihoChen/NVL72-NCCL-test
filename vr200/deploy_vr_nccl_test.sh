@@ -24,8 +24,14 @@
 #                                                       # file (high-IP first, reversed:
 #                                                       # node-00 = lowest = LAST entry)
 #   ./deploy_vr_nccl_test.sh --hosts ip1,ip2            # or an explicit list, tray 1 first
+#   ./deploy_vr_nccl_test.sh --hosts 10.0.0.11-28       # no rack file: an IP range (18 trays,
+#                                                       # 10.0.0.11 = node-00 ... 10.0.0.28)
+#   ./deploy_vr_nccl_test.sh --hosts trays.txt          # or a file: IPs and/or ranges, one or
+#                                                       # more per line, '#' comments
 #   ./deploy_vr_nccl_test.sh rackNN.sh my-pack.tar.gz   # default: ./nccl-test-pack-vr-arm64.tar.gz
 #   ./deploy_vr_nccl_test.sh rackNN.sh --only ip3,ip4   # re-push the pack to swapped tray(s) only
+#                                                       # (--hosts and --only take the same forms:
+#                                                       # IPs, ranges like 10.0.0.11-28, a file)
 #   ./deploy_vr_nccl_test.sh rackNN.sh --bootstrap [password]
 #   ./deploy_vr_nccl_test.sh rackNN.sh --auto [-- <run_vr_nccl_test.sh args>]
 #   ./deploy_vr_nccl_test.sh rackNN.sh --dry-run        # print what would be done
@@ -53,7 +59,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.9-vr"
+SCRIPT_VERSION="0.10-vr"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PACK_NAME="nccl-test-pack-vr-arm64.tar.gz"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
@@ -120,11 +126,45 @@ PACK_INFO=$(tar -xzOf "$PACK" --occurrence=1 PACK_INFO 2>/dev/null \
 PACK_SHA=$(sha256sum "$PACK" | cut -d' ' -f1)
 PACK_BASENAME=$(basename "$PACK")
 
+# expand_hosts SPEC: print the trays' IPs, one per line, in the order given.
+# SPEC is a comma- or space-separated list of items; an item is
+#   10.0.0.11                one IP
+#   10.0.0.11-28             a range of the last number (10.0.0.11 .. 10.0.0.28)
+#   10.0.0.11-10.0.0.28      the same range written out
+#   trays.txt                a file of such items (any mix, one or more per
+#                            line, '#' starts a comment); also looked up next
+#                            to this script
+# A bad item is an error (returns 1, message on stderr); callers reject duplicates.
+expand_hosts() {
+  local items item p x y n f oct
+  read -ra items <<< "${1//,/ }"
+  for item in "${items[@]}"; do
+    if [[ "$item" =~ ^(([0-9]{1,3}\.){3})([0-9]{1,3})-(([0-9]{1,3}\.){3})?([0-9]{1,3})$ ]]; then
+      p="${BASH_REMATCH[1]}"; x=$((10#${BASH_REMATCH[3]})); y=$((10#${BASH_REMATCH[6]}))
+      if [[ -n "${BASH_REMATCH[4]}" && "${BASH_REMATCH[4]}" != "$p" ]]; then
+        echo "ERROR: IP range '$item': only the last number may change (e.g. 10.0.0.11-28)" >&2; return 1
+      fi
+      for oct in ${p//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      (( x <= y && y <= 255 )) || { echo "ERROR: IP range '$item': first must be <= last <= 255" >&2; return 1; }
+      for ((n=x; n<=y; n++)); do echo "$p$n"; done
+    elif [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      for oct in ${item//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      echo "$item"
+    elif [[ "${_EXPAND_IN_FILE:-0}" -eq 0 ]] && { f="$item"; [[ -f "$f" ]] || { f="${SCRIPT_DIR:-.}/$item"; [[ -f "$f" ]]; }; }; then
+      _EXPAND_IN_FILE=1 expand_hosts "$(sed 's/#.*//' "$f" | tr '\n' ' ')" || return 1
+    else
+      echo "ERROR: '$item' is not an IP, an IP range (10.0.0.11-28) or a hosts file" >&2; return 1
+    fi
+  done
+}
+
 # --- Tray list: tray 1 (index 0) is the launch node -----------------------
 NODES=()
 if [[ -n "$HOSTS_RAW" ]]; then
   [[ -z "$RACK_FILE" ]] || { echo "ERROR: give either a rack file or --hosts, not both" >&2; exit 1; }
-  IFS=',' read -ra NODES <<< "$HOSTS_RAW"
+  HOSTS_LIST=$(expand_hosts "$HOSTS_RAW") || exit 1
+  [[ -n "$HOSTS_LIST" ]] || { echo "ERROR: --hosts gave no IPs" >&2; exit 1; }
+  mapfile -t NODES <<< "$HOSTS_LIST"
 elif [[ -n "$RACK_FILE" ]]; then
   [[ -f "$RACK_FILE" ]] || RACK_FILE="$SCRIPT_DIR/$RACK_FILE"
   [[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found: $RACK_FILE" >&2; exit 1; }
@@ -139,7 +179,7 @@ elif [[ -n "$RACK_FILE" ]]; then
     [[ -n "$RACK_NUM" ]] && MNNVL_UUID="0x$(printf '%02d' "$((10#$RACK_NUM))")"
   fi
 else
-  echo "Usage: $0 <rack_file.sh> | --hosts ip1,ip2,...  [pack.tar.gz] [options]  (see --help)" >&2
+  echo "Usage: $0 <rack_file.sh> | --hosts ip1,ip2,... | --hosts 10.0.0.11-28 | --hosts trays.txt  [pack.tar.gz] [options]  (see --help)" >&2
   exit 1
 fi
 for ip in "${NODES[@]}"; do
@@ -154,7 +194,8 @@ HOSTS_CSV="$(IFS=,; echo "${NODES[*]}")"
 # --only: limit the pack copy to these trays (mesh + staging always cover all)
 TARGET_NODES=("${NODES[@]}")
 if [[ -n "$ONLY_RAW" ]]; then
-  IFS=',' read -ra TARGET_NODES <<< "$ONLY_RAW"
+  ONLY_LIST=$(expand_hosts "$ONLY_RAW") || exit 1
+  mapfile -t TARGET_NODES <<< "$ONLY_LIST"
   for want in "${TARGET_NODES[@]}"; do
     printf '%s\n' "${NODES[@]}" | grep -qxF "$want" || { echo "ERROR: --only IP '$want' is not in the tray list" >&2; exit 1; }
   done
@@ -360,6 +401,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 #   bash run_vr_nccl_test.sh --check         # pre-flight only (no repairs), print mpirun
 #   bash run_vr_nccl_test.sh --max-size 8G   # shorter sweep (default 32G)
 #   bash run_vr_nccl_test.sh --hosts 10.0.0.1,10.0.0.2
+#   bash run_vr_nccl_test.sh --hosts 10.0.0.11-28   # an IP range, or a hosts file (see the deploy)
 #   bash run_vr_nccl_test.sh --versions-check # versions other than the targets FAIL the pre-flight
 #   bash run_vr_nccl_test.sh --versions-warn  # ... are WARN lines (default: off, like GB300:
 #                                             # versions are printed, not judged)
@@ -403,7 +445,7 @@ read -r -d '' RUNNER_SH <<'VR_RUNNER_EOF' || true
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.21-vr"
+SCRIPT_VERSION="0.22-vr"
 GPUS_PER_NODE=4
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Rack settings: deploy_vr_nccl_test.sh injects them on the next line when
@@ -452,6 +494,38 @@ RANK_ARGS=()
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
+# expand_hosts SPEC: print the trays' IPs, one per line, in the order given.
+# SPEC is a comma- or space-separated list of items; an item is
+#   10.0.0.11                one IP
+#   10.0.0.11-28             a range of the last number (10.0.0.11 .. 10.0.0.28)
+#   10.0.0.11-10.0.0.28      the same range written out
+#   trays.txt                a file of such items (any mix, one or more per
+#                            line, '#' starts a comment); also looked up next
+#                            to this script
+# A bad item is an error (returns 1, message on stderr); callers reject duplicates.
+expand_hosts() {
+  local items item p x y n f oct
+  read -ra items <<< "${1//,/ }"
+  for item in "${items[@]}"; do
+    if [[ "$item" =~ ^(([0-9]{1,3}\.){3})([0-9]{1,3})-(([0-9]{1,3}\.){3})?([0-9]{1,3})$ ]]; then
+      p="${BASH_REMATCH[1]}"; x=$((10#${BASH_REMATCH[3]})); y=$((10#${BASH_REMATCH[6]}))
+      if [[ -n "${BASH_REMATCH[4]}" && "${BASH_REMATCH[4]}" != "$p" ]]; then
+        echo "ERROR: IP range '$item': only the last number may change (e.g. 10.0.0.11-28)" >&2; return 1
+      fi
+      for oct in ${p//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      (( x <= y && y <= 255 )) || { echo "ERROR: IP range '$item': first must be <= last <= 255" >&2; return 1; }
+      for ((n=x; n<=y; n++)); do echo "$p$n"; done
+    elif [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      for oct in ${item//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      echo "$item"
+    elif [[ "${_EXPAND_IN_FILE:-0}" -eq 0 ]] && { f="$item"; [[ -f "$f" ]] || { f="${SCRIPT_DIR:-.}/$item"; [[ -f "$f" ]]; }; }; then
+      _EXPAND_IN_FILE=1 expand_hosts "$(sed 's/#.*//' "$f" | tr '\n' ' ')" || return 1
+    else
+      echo "ERROR: '$item' is not an IP, an IP range (10.0.0.11-28) or a hosts file" >&2; return 1
+    fi
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --hosts)         HOSTS_RAW="$2"; shift 2 ;;
@@ -485,7 +559,14 @@ if [[ -z "$HOSTS_RAW" ]]; then
   echo "ERROR: no hosts: pass --hosts ip1,ip2,... (tray 1 first) or stage with deploy_vr_nccl_test.sh" >&2
   exit 1
 fi
-IFS=',' read -ra NODES <<< "$HOSTS_RAW"
+# Ranges / a hosts file become the plain list; HOSTS_RAW is passed on as CSV
+HOSTS_LIST=$(expand_hosts "$HOSTS_RAW") || exit 1
+mapfile -t NODES <<< "$HOSTS_LIST"
+if [[ -z "$HOSTS_LIST" || $(printf '%s\n' "${NODES[@]}" | sort -u | wc -l) -ne ${#NODES[@]} ]]; then
+  echo "ERROR: the host list is empty or has duplicate IPs: ${NODES[*]}" >&2
+  exit 1
+fi
+HOSTS_RAW="$(IFS=,; echo "${NODES[*]}")"
 NODES_REQUESTED="${NODES_REQUESTED:-${#NODES[@]}}"
 if ! [[ "$NODES_REQUESTED" =~ ^[0-9]+$ ]] || (( NODES_REQUESTED < 1 || NODES_REQUESTED > ${#NODES[@]} )); then
   echo "ERROR: node count must be 1..${#NODES[@]} (got: $NODES_REQUESTED)" >&2

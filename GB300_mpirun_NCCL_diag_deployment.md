@@ -504,6 +504,12 @@ bash /root/portable-nccl/run/run_nccl_test.sh
 # Check script version
 ./deploy_rack_nccl_test.sh --version
 
+# No rack file (e.g. a field site): an IP range or a file of IPs/ranges,
+# node-00 = the FIRST IP. Give --uuid, since there is no rack number to
+# derive it from (v0.26; same forms as vr200/deploy_vr_nccl_test.sh --hosts)
+./deploy_rack_nccl_test.sh --hosts 192.168.14.180-197 --uuid 0x17   # 18 nodes
+./deploy_rack_nccl_test.sh --hosts nodes.txt --uuid 0x17            # '#' comments ok
+
 # After swapping one node, redeploy just that node
 ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.191
 

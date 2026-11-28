@@ -47,6 +47,12 @@
 #   ./deploy_rack_nccl_test.sh rack17.sh --only 192.168.14.187,192.168.14.191
 #                                                 # redeploy just these node(s) after a
 #                                                 # hardware swap
+#   ./deploy_rack_nccl_test.sh --hosts 192.168.14.180-197 --uuid 0x17
+#                                                 # no rack file (e.g. at a field site):
+#                                                 # an IP range, node-00 = FIRST IP
+#   ./deploy_rack_nccl_test.sh --hosts nodes.txt --uuid 0x17
+#                                                 # or a file of IPs/ranges, one or more
+#                                                 # per line, '#' comments (v0.26)
 #
 # run_nccl_test.sh itself takes an optional NODE-count argument when run
 # manually on node-00 -- this is intentionally a node-00-side decision,
@@ -127,9 +133,17 @@
 # deployed with vr200/deploy_vr_nccl_test.sh is redeployed cleanly: no
 # leftover library or Open MPI plugin is loaded ahead of this pack's.
 
+# v0.26: --hosts <spec> instead of a rack file, for sites with no rackXX.sh.
+# <spec> is IPs, ranges of the last number and/or a file, comma separated:
+# 10.0.0.11-28 = 18 nodes, 10.0.0.11 .. 10.0.0.28. The list is used in the
+# order given, so node-00 is the FIRST IP (a rack file's CM_IPS is reversed
+# instead, as before). --only takes the same forms. With --hosts there is no
+# rack name to derive NCCL_MNNVL_UUID from, so give --uuid (else 0x0, warned).
+# Same --hosts forms as vr200/deploy_vr_nccl_test.sh.
+
 set -euo pipefail
 
-SCRIPT_VERSION="0.25"
+SCRIPT_VERSION="0.26"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
 IMEX_CFG="/etc/nvidia-imex/nodes_config.cfg"
@@ -157,6 +171,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 RACK_FILE=""
+HOSTS_RAW=""
 PACK=""
 DRY_RUN=0
 AUTO=0
@@ -180,16 +195,58 @@ while [[ $# -gt 0 ]]; do
     --uuid)     MNNVL_UUID="$2"; shift 2 ;;
     --only)     ONLY_RAW="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
+    --hosts)    HOSTS_RAW="$2"; shift 2 ;;
     *.tar.gz)   PACK="$1"; shift ;;
     *)          RACK_FILE="$1"; shift ;;
   esac
 done
-[[ -n "$RACK_FILE" ]] || { echo "Usage: $0 <rack_file.sh> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap [password]] [--version]" >&2; exit 1; }
+[[ -n "$RACK_FILE" || -n "$HOSTS_RAW" ]] || { echo "Usage: $0 <rack_file.sh> | --hosts <ip,ip-range,file> [pack.tar.gz] [--data-dir <path>] [--uuid 0xNNNN] [--only ip1,ip2] [--auto] [--dry-run] [--bootstrap [password]] [--version]" >&2; exit 1; }
 DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 
-[[ -f "$RACK_FILE" ]] || RACK_FILE="$SCRIPT_DIR/$RACK_FILE"
-[[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found (checked cwd and $SCRIPT_DIR)" >&2; exit 1; }
+# expand_hosts SPEC: print the trays' IPs, one per line, in the order given.
+# SPEC is a comma- or space-separated list of items; an item is
+#   10.0.0.11                one IP
+#   10.0.0.11-28             a range of the last number (10.0.0.11 .. 10.0.0.28)
+#   10.0.0.11-10.0.0.28      the same range written out
+#   trays.txt                a file of such items (any mix, one or more per
+#                            line, '#' starts a comment); also looked up next
+#                            to this script
+# A bad item is an error (returns 1, message on stderr); callers reject duplicates.
+expand_hosts() {
+  local items item p x y n f oct
+  read -ra items <<< "${1//,/ }"
+  for item in "${items[@]}"; do
+    if [[ "$item" =~ ^(([0-9]{1,3}\.){3})([0-9]{1,3})-(([0-9]{1,3}\.){3})?([0-9]{1,3})$ ]]; then
+      p="${BASH_REMATCH[1]}"; x=$((10#${BASH_REMATCH[3]})); y=$((10#${BASH_REMATCH[6]}))
+      if [[ -n "${BASH_REMATCH[4]}" && "${BASH_REMATCH[4]}" != "$p" ]]; then
+        echo "ERROR: IP range '$item': only the last number may change (e.g. 10.0.0.11-28)" >&2; return 1
+      fi
+      for oct in ${p//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      (( x <= y && y <= 255 )) || { echo "ERROR: IP range '$item': first must be <= last <= 255" >&2; return 1; }
+      for ((n=x; n<=y; n++)); do echo "$p$n"; done
+    elif [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      for oct in ${item//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
+      echo "$item"
+    elif [[ "${_EXPAND_IN_FILE:-0}" -eq 0 ]] && { f="$item"; [[ -f "$f" ]] || { f="${SCRIPT_DIR:-.}/$item"; [[ -f "$f" ]]; }; }; then
+      _EXPAND_IN_FILE=1 expand_hosts "$(sed 's/#.*//' "$f" | tr '\n' ' ')" || return 1
+    else
+      echo "ERROR: '$item' is not an IP, an IP range (10.0.0.11-28) or a hosts file" >&2; return 1
+    fi
+  done
+}
+
+if [[ -n "$HOSTS_RAW" ]]; then
+  [[ -z "$RACK_FILE" ]] || { echo "ERROR: give either a rack file or --hosts, not both" >&2; exit 1; }
+  # For messages, the log name and the redeploy hint in run_nccl_test.sh
+  RACK_LABEL="hosts"
+  REDEPLOY_ARGS="--hosts $HOSTS_RAW"
+else
+  [[ -f "$RACK_FILE" ]] || RACK_FILE="$SCRIPT_DIR/$RACK_FILE"
+  [[ -f "$RACK_FILE" ]] || { echo "ERROR: rack file not found (checked cwd and $SCRIPT_DIR)" >&2; exit 1; }
+  RACK_LABEL="$(basename "$RACK_FILE" .sh)"
+  REDEPLOY_ARGS="$(basename "$RACK_FILE")"
+fi
 
 # Auto-derive NCCL_MNNVL_UUID from the rack filename if not explicitly given
 #
@@ -199,8 +256,11 @@ DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 # with "printf: invalid octal number" on any digit string containing 8/9
 # (e.g. rack IDs like 060629), killing the whole script under set -e before
 # the SSH mesh or node-00 resolution ever run.
-if [[ -z "$MNNVL_UUID" ]]; then
-  RACK_NUM=$(basename "$RACK_FILE" .sh | grep -oE '[0-9]+' | head -1)
+if [[ -z "$MNNVL_UUID" && -n "$HOSTS_RAW" ]]; then
+  MNNVL_UUID="0x0"
+  echo "WARNING: --hosts has no rack number to derive NCCL_MNNVL_UUID from -- defaulting to 0x0 (set --uuid explicitly, e.g. --uuid 0x17)" >&2
+elif [[ -z "$MNNVL_UUID" ]]; then
+  RACK_NUM=$(basename "$RACK_FILE" .sh | grep -oE '[0-9]+' | head -1 || true)
   if [[ -n "$RACK_NUM" ]]; then
     MNNVL_UUID="0x$(printf '%02d' "$((10#$RACK_NUM))")"
     echo "Auto-derived NCCL_MNNVL_UUID=${MNNVL_UUID} from rack filename (override with --uuid)"
@@ -224,30 +284,40 @@ RUN_DIR="${DATA_DIR}/run"
 
 [[ $DRY_RUN -eq 1 ]] && echo ">>> DRY-RUN MODE: no SSH/SCP/mount commands will actually run <<<"
 
-# shellcheck source=/dev/null
-source "$RACK_FILE"
-[[ -n "${CM_IPS:-}" ]] || { echo "ERROR: CM_IPS array not found in $RACK_FILE" >&2; exit 1; }
-
-# CM_IPS is listed high-IP-first (IP17..IP0); reverse so index 0 = IP0 = node-00
 NODES=()
-for ((i=${#CM_IPS[@]}-1; i>=0; i--)); do NODES+=("${CM_IPS[$i]}"); done
+if [[ -n "$HOSTS_RAW" ]]; then
+  # --hosts: in the order given, node-00 first
+  HOSTS_LIST=$(expand_hosts "$HOSTS_RAW") || exit 1
+  [[ -n "$HOSTS_LIST" ]] || { echo "ERROR: --hosts gave no IPs" >&2; exit 1; }
+  mapfile -t NODES <<< "$HOSTS_LIST"
+  if [[ $(printf '%s\n' "${NODES[@]}" | sort -u | wc -l) -ne ${#NODES[@]} ]]; then
+    echo "ERROR: --hosts has duplicate IPs: ${NODES[*]}" >&2; exit 1
+  fi
+else
+  # shellcheck source=/dev/null
+  source "$RACK_FILE"
+  [[ -n "${CM_IPS:-}" ]] || { echo "ERROR: CM_IPS array not found in $RACK_FILE" >&2; exit 1; }
+  # CM_IPS is listed high-IP-first (IP17..IP0); reverse so index 0 = IP0 = node-00
+  for ((i=${#CM_IPS[@]}-1; i>=0; i--)); do NODES+=("${CM_IPS[$i]}"); done
+fi
 NODE00="${NODES[0]}"
 TOTAL_RANKS=$(( ${#NODES[@]} * GPUS_PER_NODE ))
 
-echo "=== Rack: $(basename "$RACK_FILE") | ${#NODES[@]} nodes | node-00=$NODE00 | pack=$PACK_BASENAME ($(stat -c%s "$PACK" 2>/dev/null || echo '?') bytes) | UUID=$MNNVL_UUID | data-dir=$DATA_DIR ==="
+echo "=== Rack: ${REDEPLOY_ARGS} | ${#NODES[@]} nodes | node-00=$NODE00 | pack=$PACK_BASENAME ($(stat -c%s "$PACK" 2>/dev/null || echo '?') bytes) | UUID=$MNNVL_UUID | data-dir=$DATA_DIR ==="
 
 # --- Resolve --only into TARGET_NODES (the nodes that get the pack
 # copy+extract re-applied). SSH mesh + staging always cover the full rack
 # since those are cheap and idempotent anyway.
 TARGET_NODES=("${NODES[@]}")
 if [[ -n "$ONLY_RAW" ]]; then
-  IFS=',' read -ra ONLY_IPS <<< "$ONLY_RAW"
+  ONLY_LIST=$(expand_hosts "$ONLY_RAW") || exit 1
+  mapfile -t ONLY_IPS <<< "$ONLY_LIST"
   TARGET_NODES=()
   for want in "${ONLY_IPS[@]}"; do
     found=0
     for ip in "${NODES[@]}"; do [[ "$ip" == "$want" ]] && { found=1; break; }; done
     if [[ $found -eq 0 ]]; then
-      echo "ERROR: --only IP '$want' is not in $(basename "$RACK_FILE")'s CM_IPS" >&2
+      echo "ERROR: --only IP '$want' is not in the node list (${REDEPLOY_ARGS})" >&2
       exit 1
     fi
     TARGET_NODES+=("$want")
@@ -540,7 +610,7 @@ if [[ \${#MESH_BROKEN[@]} -gt 0 ]]; then
   echo "" >&2
   echo "This can happen after a reboot/reimage on this hardware -- the mesh doesn't" >&2
   echo "always survive it. From the jumper, re-run the deploy with --bootstrap:" >&2
-  echo "  ./deploy_rack_nccl_test.sh $(basename "$RACK_FILE") --bootstrap <password>" >&2
+  echo "  ./deploy_rack_nccl_test.sh ${REDEPLOY_ARGS} --bootstrap <password>" >&2
   echo "then retry this script. (mpirun would otherwise hang silently here with no" >&2
   echo "way to prompt for a password.)" >&2
   exit 1
@@ -718,7 +788,7 @@ run_one() {
 }
 
 {
-  echo "\$(date) : $(basename "$RACK_FILE" .sh) | \$NODES_REQUESTED node(s) | \$RUN_GPUS GPUs | launch \$(hostname)"
+  echo "\$(date) : ${RACK_LABEL} | \$NODES_REQUESTED node(s) | \$RUN_GPUS GPUs | launch \$(hostname)"
   run_one "\$ALLREDUCE_BIN" "-b 8 -e 32G -f 2 -g 1" "All-Reduce (\$RUN_GPUS GPUs)"
   run_one "\$ALLTOALL_BIN"  "-d uint8 -b 8 -e 32G -f 2" "All-to-All (\$RUN_GPUS GPUs)"
   echo "\$(date) : Done."
@@ -739,12 +809,12 @@ else
 fi
 
 echo ""
-echo "=== Deploy complete: $(basename "$RACK_FILE") | node-00=${NODE00} | data-dir=${DATA_DIR} ==="
+echo "=== Deploy complete: ${REDEPLOY_ARGS} | node-00=${NODE00} | data-dir=${DATA_DIR} ==="
 
 if [[ $AUTO -eq 1 ]]; then
   echo "--- [4/4] --auto: executing run_nccl_test.sh on node-00 now (includes pre-flight) ---"
   mkdir -p results
-  LOGFILE="results/$(basename "$RACK_FILE" .sh)_$(date +%Y%m%d_%H%M%S).log"
+  LOGFILE="results/${RACK_LABEL}_$(date +%Y%m%d_%H%M%S).log"
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] would: ssh root@${NODE00} bash ${RUN_DIR}/run_nccl_test.sh   (output -> $LOGFILE)"
   else
