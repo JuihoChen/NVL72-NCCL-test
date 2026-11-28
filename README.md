@@ -22,7 +22,8 @@ cd vr200
 Both deploy scripts take `--hosts` instead of `rackXX.sh`, e.g. at a field
 site: `--hosts 10.0.0.11-28` is 18 nodes (10.0.0.11 = node-00 ... 10.0.0.28),
 and `--hosts nodes.txt` reads IPs and/or ranges from a file (one or more per
-line, `#` comments). Items can be mixed with commas
+line, `#` comments). A range may count down: `192.168.101.154-137` makes
+.154 node-00, then .153 ... .137. Items can be mixed with commas
 (`10.0.0.11-26,10.0.0.30,10.0.0.31`); the order given is the node order, so
 node-00 is the first IP. `--only` takes the same forms.
 

@@ -135,7 +135,8 @@
 
 # v0.26: --hosts <spec> instead of a rack file, for sites with no rackXX.sh.
 # <spec> is IPs, ranges of the last number and/or a file, comma separated:
-# 10.0.0.11-28 = 18 nodes, 10.0.0.11 .. 10.0.0.28. The list is used in the
+# 10.0.0.11-28 = 18 nodes, 10.0.0.11 .. 10.0.0.28; 10.0.0.28-11 counts down
+# (10.0.0.28 = node-00). The list is used in the
 # order given, so node-00 is the FIRST IP (a rack file's CM_IPS is reversed
 # instead, as before). --only takes the same forms. With --hosts there is no
 # rack name to derive NCCL_MNNVL_UUID from, so give --uuid (else 0x0, warned).
@@ -209,6 +210,8 @@ DATA_DIR="${DATA_DIR%/}"   # strip any trailing slash for clean path joins
 #   10.0.0.11                one IP
 #   10.0.0.11-28             a range of the last number (10.0.0.11 .. 10.0.0.28)
 #   10.0.0.11-10.0.0.28      the same range written out
+#   10.0.0.28-11             a descending range (10.0.0.28 .. 10.0.0.11):
+#                            the first number is node-00 either way
 #   trays.txt                a file of such items (any mix, one or more per
 #                            line, '#' starts a comment); also looked up next
 #                            to this script
@@ -223,8 +226,10 @@ expand_hosts() {
         echo "ERROR: IP range '$item': only the last number may change (e.g. 10.0.0.11-28)" >&2; return 1
       fi
       for oct in ${p//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
-      (( x <= y && y <= 255 )) || { echo "ERROR: IP range '$item': first must be <= last <= 255" >&2; return 1; }
-      for ((n=x; n<=y; n++)); do echo "$p$n"; done
+      (( x <= 255 && y <= 255 )) || { echo "ERROR: IP range '$item': numbers must be <= 255" >&2; return 1; }
+      # In the order written: 11-28 counts up, 154-137 counts down
+      if (( x <= y )); then for ((n=x; n<=y; n++)); do echo "$p$n"; done
+      else for ((n=x; n>=y; n--)); do echo "$p$n"; done; fi
     elif [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
       for oct in ${item//./ }; do (( 10#$oct <= 255 )) || { echo "ERROR: not an IPv4 address: '$item'" >&2; return 1; }; done
       echo "$item"

@@ -123,7 +123,8 @@ picks it).
 **No rack file (e.g. a field site):** `--hosts` (and `--only`) take IPs,
 ranges of the last number and/or a file, comma separated, used in the order
 given (node-00 = the first IP). `10.0.0.11-28` is 18 trays, 10.0.0.11 to
-10.0.0.28; `10.0.0.11-10.0.0.28` is the same. A file holds the same items,
+10.0.0.28; `10.0.0.11-10.0.0.28` is the same. A range can also count down:
+`192.168.101.154-137` is 18 trays with node-00 = .154, then .153 ... .137. A file holds the same items,
 one or more per line, with `#` comments, e.g.
 
 ```text
